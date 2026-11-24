@@ -159,8 +159,9 @@
         <button data-periodo="oggi">Oggi</button>
         <button data-periodo="settimana">Questa settimana</button>
         <button data-periodo="mese">Questo mese</button>
+        <label>Formato <select id="rFormato"><option value="pdf">PDF</option><option value="csv">CSV (Excel)</option></select></label>
         <button id="btnCsvRiepilogo">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0-4-4m4 4 4-4M4 21h16"/></svg> Esporta CSV
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0-4-4m4 4 4-4M4 21h16"/></svg> Esporta
         </button>
       </div>
     </div>
@@ -172,7 +173,7 @@
     <div class="card">
       <h2>Giornate</h2>
       <div class="tabella"><table>
-        <thead><tr><th>Data</th><th>Dipendente</th><th>Entrate / uscite</th><th>Ore conteggiate</th><th>Pause</th><th>Esito pausa</th><th>Note</th></tr></thead>
+        <thead><tr><th>Data</th><th>Dipendente</th><th>Entrate / uscite</th><th>Ore</th><th>Pause</th><th>Esito pausa</th><th>Note</th></tr></thead>
         <tbody id="tabGiornate"></tbody>
       </table></div>
     </div>
@@ -188,7 +189,8 @@
         <label>Dipendente <select id="fDip"></select></label>
       </div>
       <div class="filtri" style="margin-top:12px">
-        <span class="tenue">Esporta CSV:</span>
+        <label>Formato <select id="fFormato"><option value="pdf">PDF</option><option value="csv">CSV (Excel)</option></select></label>
+        <span class="tenue">Esporta:</span>
         <button id="xDipMese">Dipendente · mese</button>
         <button id="xDipAnno">Dipendente · anno</button>
         <button id="xTotMese">Totale mese (tutti)</button>
@@ -210,7 +212,8 @@
         <label>Al <input type="date" id="tAl"></label>
         <label>Dipendente <select id="tDip"></select></label>
         <button id="btnAggiungiTimbratura" class="primario">+ Aggiungi timbratura</button>
-        <button id="btnCsvTimbrature">Esporta CSV</button>
+        <label>Formato <select id="tFormato"><option value="pdf">PDF</option><option value="csv">CSV (Excel)</option></select></label>
+        <button id="btnCsvTimbrature">Esporta</button>
       </div>
     </div>
     <div class="card">
@@ -316,6 +319,9 @@
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<!-- jsPDF + AutoTable: generazione dei PDF direttamente nel browser -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <script>
 /* =====================================================================
    1. DATI E SALVATAGGIO
@@ -916,12 +922,11 @@ function descriviSessioni(g) {
 function renderRiepilogo() {
   const gg = giornateFiltrate();
   const totMin = gg.reduce((s, g) => s + g.pagatoMin, 0);
-  const totEff = gg.reduce((s, g) => s + g.lavoratoMin, 0);
   const mancanti = gg.filter(g => g.esito.testo === 'Pausa mancante' || g.esito.testo === 'Pausa troppo breve').length;
   const anomalie = gg.filter(g => g.anomalie.length).length;
 
   document.getElementById('kpi').innerHTML = `
-    <div><b>${fmtHM(totMin)}</b><span>Ore conteggiate (effettive ${fmtHM(totEff)})</span></div>
+    <div><b>${fmtHM(totMin)}</b><span>Ore nel periodo</span></div>
     <div><b>${gg.length}</b><span>Giornate</span></div>
     <div><b style="color:${mancanti ? 'var(--err)' : 'inherit'}">${mancanti}</b><span>Pause mancanti o troppo brevi</span></div>
     <div><b style="color:${anomalie ? 'var(--err)' : 'inherit'}">${anomalie}</b><span>Giornate da verificare</span></div>`;
@@ -944,7 +949,7 @@ function renderRiepilogo() {
       <td class="num">${fmtData(g.data)}</td>
       <td><a href="#" class="link" title="Apri il foglio ore per correggere" onclick="apriFoglio('${g.dipId}','${g.data.slice(0, 7)}');return false">${esc(nomeDip(g.dipId))}</a><div class="tenue">${esc(dipendente(g.dipId)?.reparto || '')}</div></td>
       <td class="num">${descriviSessioni(g)}${S().arrotondaPassoMin && descriviConteggiati(g) ? `<div class="tenue">conteggiato ${descriviConteggiati(g)}</div>` : ''}</td>
-      <td class="num"><b>${fmtHM(g.pagatoMin)}</b><div class="tenue">effettive ${fmtHM(g.lavoratoMin)}</div></td>
+      <td class="num"><b>${fmtHM(g.pagatoMin)}</b></td>
       <td>${pause}</td>
       <td><span class="etichetta e-${g.esito.cod}">${g.esito.testo}</span></td>
       <td>${g.anomalie.map(esc).join('<br>')}</td></tr>`;
@@ -1181,30 +1186,90 @@ document.getElementById('btnEsportaBackup').onclick = () => {
 };
 
 /* =====================================================================
-   13. ESPORTAZIONE CSV (separatore ";" per Excel italiano)
+   13. EXPORT CSV E PDF
+   ---------------------------------------------------------------------
+   Ogni export prepara un "report" con questa forma:
+     { file, titolo, info: [[etichetta, valore]], testa: [colonne],
+       righe: [[...]], totali: [[...]], orizzontale, caratteri }
+   e poi esporta() lo scarica nel formato scelto (PDF o CSV per Excel).
    ===================================================================== */
 const cella = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
-function csv(righe) { return '﻿' + righe.map(r => r.map(cella).join(';')).join('\r\n'); }
+const fmtDataBreve = iso => iso.split('-').reverse().join('/');             // 2026-11-02 -> 02/11/2026
+const nomeMese = mese => new Date(mese + '-15').toLocaleDateString('it-IT', { month: 'long', year: 'numeric' });
 
+function reportCsv(r) {
+  const righe = [...r.info, [], r.testa.map(c => c.replace(/\n/g, ' ')), ...r.righe, ...(r.totali.length ? [[], ...r.totali] : [])];
+  return '﻿' + righe.map(x => x.map(cella).join(';')).join('\r\n');
+}
+
+function reportPdf(r) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation: r.orizzontale ? 'landscape' : 'portrait', unit: 'mm', format: 'a4' });
+  const L = doc.internal.pageSize.getWidth(), A = doc.internal.pageSize.getHeight();
+  // Intestazione
+  doc.setFontSize(9); doc.setTextColor(102, 112, 133);
+  doc.text('Hotel Rosanna - Rilevazione presenze', 10, 11);
+  doc.setFontSize(15); doc.setTextColor(28, 36, 48);
+  doc.text(r.titolo, 10, 19);
+  doc.setFontSize(9); doc.setTextColor(71, 84, 103);
+  doc.text(r.info.map(([k, v]) => `${k}: ${v}`).join('     '), 10, 25);
+  // Tabella
+  doc.autoTable({
+    head: [r.testa], body: r.righe, foot: r.totali.length ? r.totali : undefined, showFoot: 'lastPage',
+    startY: 29, theme: 'grid', margin: { left: 10, right: 10, bottom: 14 },
+    styles: { fontSize: r.caratteri || 8, cellPadding: r.spaziatura ?? 1.2, lineColor: [226, 229, 234], lineWidth: 0.1, textColor: [28, 36, 48], valign: 'middle' },
+    headStyles: { fillColor: [15, 95, 140], textColor: 255, fontStyle: 'bold', halign: 'center' },
+    footStyles: { fillColor: [227, 240, 247], textColor: [15, 95, 140], fontStyle: 'bold' },
+    didParseCell: d => {
+      if (d.section !== 'body') return;
+      const prima = String(d.row.raw[0] || '');
+      if (prima.startsWith('TOTALE')) { d.cell.styles.fontStyle = 'bold'; d.cell.styles.fillColor = [238, 240, 243]; }
+      if (r.domeniche?.has(d.row.index) && d.column.index < 2) d.cell.styles.textColor = [180, 35, 24];
+    },
+    didDrawPage: () => {
+      doc.setFontSize(7); doc.setTextColor(150);
+      doc.text(`Generato il ${new Date().toLocaleString('it-IT')}`, 10, A - 7);
+      doc.text(`Pagina ${doc.internal.getNumberOfPages()} di {totale}`, L - 10, A - 7, { align: 'right' });
+    }
+  });
+  doc.putTotalPages('{totale}');
+  return doc;
+}
+
+function esporta(r, formato) {
+  if (formato === 'pdf') reportPdf(r).save(r.file + '.pdf');
+  else scarica(r.file + '.csv', reportCsv(r), 'text/csv');
+}
+
+// Export della scheda Riepilogo (periodo e dipendente scelti nei filtri)
 document.getElementById('btnCsvRiepilogo').onclick = () => {
-  const righe = [['Data', 'Dipendente', 'Reparto', 'Entrate/Uscite', 'Orari conteggiati', 'Ore conteggiate', 'Ore effettive', 'Minuti pausa', 'Minuti turno spezzato', 'Esito pausa', 'Anomalie']];
-  for (const g of giornateFiltrate().reverse()) {
-    righe.push([g.data, nomeDip(g.dipId), dipendente(g.dipId)?.reparto || '', descriviSessioni(g), descriviConteggiati(g),
-      oreDecimali(g.pagatoMin), oreDecimali(g.lavoratoMin),
-      Math.round(g.pause.filter(p => p.tipo === 'pausa').reduce((s, p) => s + p.min, 0)),
-      Math.round(g.pause.filter(p => p.tipo === 'spezzato').reduce((s, p) => s + p.min, 0)),
-      g.esito.testo, g.anomalie.join(' | ')]);
-  }
-  scarica(`presenze_${val('rDal')}_${val('rAl')}.csv`, csv(righe), 'text/csv');
+  const gg = giornateFiltrate().reverse();
+  const tot = gg.reduce((s, g) => s + g.pagatoMin, 0);
+  const sommaPause = (g, tipo) => Math.round(g.pause.filter(p => p.tipo === tipo).reduce((s, p) => s + p.min, 0)) || '';
+  esporta({
+    file: `presenze_${val('rDal')}_${val('rAl')}`,
+    titolo: 'Riepilogo presenze',
+    info: [['Periodo', `${fmtDataBreve(val('rDal'))} - ${fmtDataBreve(val('rAl'))}`], ['Dipendente', val('rDip') ? nomeDip(val('rDip')) : 'Tutti']],
+    testa: ['Data', 'Dipendente', 'Reparto', 'Timbrature', 'Orari conteggiati', 'Ore', 'Ore\ndecimali', 'Pausa\n(min)', 'Spezzato\n(min)', 'Esito pausa', 'Anomalie'],
+    righe: gg.map(g => [fmtDataBreve(g.data), nomeDip(g.dipId), dipendente(g.dipId)?.reparto || '', descriviSessioni(g), descriviConteggiati(g),
+      fmtHM(g.pagatoMin), oreDecimali(g.pagatoMin), sommaPause(g, 'pausa'), sommaPause(g, 'spezzato'), g.esito.testo, g.anomalie.join(' | ')]),
+    totali: [['TOTALE', `${gg.length} giornate`, '', '', '', fmtHM(tot), oreDecimali(tot), '', '', '', '']],
+    orizzontale: true, caratteri: 7.5
+  }, val('rFormato'));
 };
+
+// Export della scheda Timbrature (elenco grezzo dei passaggi)
 document.getElementById('btnCsvTimbrature').onclick = () => {
-  const righe = [['Data', 'Ora', 'Dipendente', 'Reparto', 'Badge', 'Tipo', 'Origine', 'Nota']];
-  for (const t of timbratureFiltrate().reverse()) {
-    const d = dipendente(t.dipId);
-    righe.push([dataISO(t.ts), fmtOra(t.ts), nomeDip(t.dipId), d?.reparto || '', d?.badge || '',
-      t.tipo === 'E' ? 'Entrata' : 'Uscita', t.fonte === 'badge' ? 'Badge' : 'Manuale', t.nota || '']);
-  }
-  scarica(`timbrature_${val('tDal')}_${val('tAl')}.csv`, csv(righe), 'text/csv');
+  const lista = timbratureFiltrate().reverse();
+  esporta({
+    file: `timbrature_${val('tDal')}_${val('tAl')}`,
+    titolo: 'Elenco timbrature',
+    info: [['Periodo', `${fmtDataBreve(val('tDal'))} - ${fmtDataBreve(val('tAl'))}`], ['Dipendente', val('tDip') ? nomeDip(val('tDip')) : 'Tutti']],
+    testa: ['Data', 'Ora', 'Dipendente', 'Reparto', 'Tipo', 'Origine', 'Nota'],
+    righe: lista.map(t => [fmtDataBreve(dataISO(t.ts)), fmtOra(t.ts), nomeDip(t.dipId), dipendente(t.dipId)?.reparto || '',
+      t.tipo === 'E' ? 'Entrata' : 'Uscita', { badge: 'Badge', manuale: 'Manuale', offline: 'Badge (offline)' }[t.fonte] || t.fonte, t.nota || '']),
+    totali: [], orizzontale: false
+  }, val('tFormato'));
 };
 
 /* =====================================================================
@@ -1230,8 +1295,7 @@ function giorniDelMese(mese) { // "2026-11" -> ["2026-11-01", ... "2026-11-30"]
 function totali(gg) {
   return {
     giorni: gg.filter(g => g.lavoratoMin > 0).length,
-    min: gg.reduce((s, g) => s + g.pagatoMin, 0),       // ore conteggiate (arrotondate) -> buste paga
-    minEff: gg.reduce((s, g) => s + g.lavoratoMin, 0),  // ore effettive (orari reali)
+    min: gg.reduce((s, g) => s + g.pagatoMin, 0),       // ore conteggiate (arrotondate a mezz'ora)
     mancanti: gg.filter(g => ['Pausa mancante', 'Pausa troppo breve'].includes(g.esito.testo)).length,
     verificare: gg.filter(g => g.anomalie.length).length
   };
@@ -1268,7 +1332,7 @@ function renderFoglio() {
   document.getElementById('xDipMese').disabled = document.getElementById('xDipAnno').disabled = !dipId;
 
   document.getElementById('fKpi').innerHTML = `
-    <div><b>${fmtHM(t.min)}</b><span>Ore conteggiate nel mese (${oreDecimali(t.min)} decimali) · effettive ${fmtHM(t.minEff)}</span></div>
+    <div><b>${fmtHM(t.min)}</b><span>Ore nel mese (${oreDecimali(t.min)} decimali)</span></div>
     <div><b>${t.giorni}</b><span>${dipId ? 'Giorni lavorati' : 'Giornate lavorate (tutti)'}</span></div>
     <div><b style="color:${t.mancanti ? 'var(--err)' : 'inherit'}">${t.mancanti}</b><span>Pause mancanti o brevi</span></div>
     <div><b style="color:${t.verificare ? 'var(--err)' : 'inherit'}">${t.verificare}</b><span>Giornate da verificare</span></div>`;
@@ -1286,14 +1350,13 @@ function renderFoglio() {
         <td class="num"><b>${fmtHM(tt.min)}</b></td>
         <td class="num">${oreDecimali(tt.min)}</td>
         <td class="num">${tt.giorni ? fmtHM(tt.min / tt.giorni) : '—'}</td>
-        <td class="num tenue">${fmtHM(tt.minEff)}</td>
         <td class="num">${tt.mancanti || ''}</td>
         <td class="num" style="color:var(--err)">${tt.verificare || ''}</td></tr>`;
     }).join('');
     box.innerHTML = `<table>
-      <thead><tr><th>Dipendente</th><th>Reparto</th><th>Giorni</th><th>Ore conteggiate</th><th>Ore decimali</th><th>Media/giorno</th><th>Ore effettive</th><th>Pause mancanti</th><th>Da verificare</th></tr></thead>
+      <thead><tr><th>Dipendente</th><th>Reparto</th><th>Giorni</th><th>Ore</th><th>Ore decimali</th><th>Media/giorno</th><th>Pause mancanti</th><th>Da verificare</th></tr></thead>
       <tbody>${righe || '<tr><td colspan="9" class="vuoto">Nessun dipendente.</td></tr>'}</tbody>
-      <tfoot><tr><td colspan="2">Totale</td><td class="num">${t.giorni}</td><td class="num">${fmtHM(t.min)}</td><td class="num">${oreDecimali(t.min)}</td><td></td><td class="num">${fmtHM(t.minEff)}</td><td class="num">${t.mancanti}</td><td class="num">${t.verificare}</td></tr></tfoot>
+      <tfoot><tr><td colspan="2">Totale</td><td class="num">${t.giorni}</td><td class="num">${fmtHM(t.min)}</td><td class="num">${oreDecimali(t.min)}</td><td></td><td class="num">${t.mancanti}</td><td class="num">${t.verificare}</td></tr></tfoot>
     </table>`;
     return;
   }
@@ -1311,7 +1374,7 @@ function renderFoglio() {
         ${ses.length ? `<button class="piccolo" title="Aggiungi un'altra entrata/uscita" onclick="aggiungiCoppia('${data}')">+</button>` : ''}</div>
         ${g && S().arrotondaPassoMin && descriviConteggiati(g) ? `<div class="tenue">conteggiato ${descriviConteggiati(g)}</div>` : ''}</td>
       <td class="num"><b>${g && g.lavoratoMin ? fmtHM(g.pagatoMin) : ''}</b>
-        ${g && g.lavoratoMin ? `<div class="tenue">eff. ${fmtHM(g.lavoratoMin)}</div>` : ''}</td>
+</td>
       <td class="num">${g && minPausa(g) ? fmtDurata(minPausa(g)) : ''}</td>
       <td>${g ? `<span class="etichetta e-${g.esito.cod}">${g.esito.testo}</span>` : ''}
         ${g && g.anomalie.length ? `<div class="tenue">${g.anomalie.map(esc).join('<br>')}</div>` : ''}</td></tr>`;
@@ -1319,7 +1382,7 @@ function renderFoglio() {
   box.innerHTML = `<table>
     <thead><tr><th>Giorno</th><th>Entrata – Uscita</th><th>Ore</th><th>Pausa</th><th>Esito pausa</th></tr></thead>
     <tbody>${righe}</tbody>
-    <tfoot><tr><td>Totale</td><td>${t.giorni} giorni lavorati · effettive ${fmtHM(t.minEff)}</td><td class="num">${fmtHM(t.min)}</td><td colspan="2">${oreDecimali(t.min)} ore decimali</td></tr></tfoot>
+    <tfoot><tr><td>Totale</td><td>${t.giorni} giorni lavorati</td><td class="num">${fmtHM(t.min)}</td><td colspan="2">${oreDecimali(t.min)} ore decimali</td></tr></tfoot>
   </table>`;
 }
 
@@ -1395,100 +1458,119 @@ function salvaOraDaFoglio(inp) {
 }
 
 /* =====================================================================
-   15. EXPORT PER BUSTE PAGA (CSV ";" apribile con Excel)
+   15. EXPORT PER BUSTE PAGA (PDF o CSV)
    ===================================================================== */
 function avvisoAnomalie(gg) {
   const n = gg.filter(g => g.anomalie.length).length;
   return !n || confirm(`Attenzione: ${n} giornate da verificare (entrata o uscita mancante).\n` +
     `Le ore di quelle timbrature incomplete NON sono conteggiate.\n\nEsportare comunque?`);
 }
-// Righe giorno per giorno di un dipendente
-function righeGiorni(giorni, perData) {
-  return giorni.map(data => {
-    const g = perData[data];
-    if (!g) return [data, giornoSett(data)];
-    return [data, giornoSett(data), descriviSessioni(g), descriviConteggiati(g),
-      fmtHM(g.pagatoMin), oreDecimali(g.pagatoMin), fmtHM(g.lavoratoMin),
-      Math.round(minPausa(g)), g.esito.testo, g.anomalie.join(' | ')];
-  });
+const TESTA_GIORNI = ['Data', 'Giorno', 'Timbrature', 'Orari conteggiati', 'Ore', 'Ore\ndecimali', 'Pausa\n(min)', 'Esito pausa', 'Anomalie'];
+// Una riga per giorno (anche vuota se non ha lavorato)
+function rigaGiorno(data, g) {
+  if (!g) return [fmtDataBreve(data), giornoSett(data), '', '', '', '', '', '', ''];
+  return [fmtDataBreve(data), giornoSett(data), descriviSessioni(g), descriviConteggiati(g),
+    fmtHM(g.pagatoMin), oreDecimali(g.pagatoMin), Math.round(minPausa(g)) || '', g.esito.testo, g.anomalie.join(' | ')];
 }
-const INTEST_GIORNI = ['Data', 'Giorno', 'Timbrature reali', 'Orari conteggiati', 'Ore conteggiate (h:mm)', 'Ore conteggiate decimali',
-  'Ore effettive (h:mm)', 'Minuti pausa', 'Esito pausa', 'Anomalie'];
-// Riga di totale allineata alle colonne qui sopra
-const rigaTotale = (etichetta, t) => [etichetta, `${t.giorni} giorni`, '', '', fmtHM(t.min), oreDecimali(t.min), fmtHM(t.minEff)];
+const rigaTotale = (etichetta, t) => [etichetta, `${t.giorni} ${t.giorni === 1 ? 'giorno' : 'giorni'}`, '', '', fmtHM(t.min), oreDecimali(t.min), '', '', ''];
+const giornateDip = (dipId, prefisso) =>
+  calcolaGiornate(db.timbrature.filter(t => t.dipId === dipId), S()).filter(g => g.data.startsWith(prefisso));
 
-// 1) Dipendente · mese: dettaglio giornaliero + totale
+// 1) Dipendente · mese: tutti i giorni del mese + totale
 document.getElementById('xDipMese').onclick = () => {
   const mese = val('fMese'), d = dipendente(val('fDip'));
-  const gg = calcolaGiornate(db.timbrature.filter(t => t.dipId === d.id), S()).filter(g => g.data.startsWith(mese));
+  const gg = giornateDip(d.id, mese);
   if (!avvisoAnomalie(gg)) return;
   const perData = {}; gg.forEach(g => perData[g.data] = g);
-  const t = totali(gg);
-  const righe = [['Dipendente', d.nome], ['Reparto', d.reparto || ''], ['Badge', d.badge], ['Mese', mese], [], INTEST_GIORNI,
-    ...righeGiorni(giorniDelMese(mese), perData), [],
-    rigaTotale('TOTALE MESE', t)];
-  scarica(`ore_${nomeFile(d.nome)}_${mese}.csv`, csv(righe), 'text/csv');
+  const giorni = giorniDelMese(mese);
+  esporta({
+    file: `ore_${nomeFile(d.nome)}_${mese}`,
+    titolo: `Foglio ore - ${d.nome}`,
+    info: [['Mese', nomeMese(mese)], ['Reparto', d.reparto || '-'], ['Badge', d.badge]],
+    testa: TESTA_GIORNI,
+    righe: giorni.map(data => rigaGiorno(data, perData[data])),
+    domeniche: new Set(giorni.map((x, i) => isDomenica(x) ? i : -1).filter(i => i >= 0)),
+    totali: [rigaTotale('TOTALE MESE', totali(gg))],
+    orizzontale: true, caratteri: 7.5, spaziatura: 0.85   // tutto il mese su una pagina
+  }, val('fFormato'));
 };
 
-// 2) Dipendente · anno: dettaglio giornaliero con subtotale di ogni mese
+// 2) Dipendente · anno: solo i giorni lavorati, con il totale di ogni mese
 document.getElementById('xDipAnno').onclick = () => {
   const anno = val('fMese').slice(0, 4), d = dipendente(val('fDip'));
-  const gg = calcolaGiornate(db.timbrature.filter(t => t.dipId === d.id), S()).filter(g => g.data.startsWith(anno));
+  const gg = giornateDip(d.id, anno);
   if (!avvisoAnomalie(gg)) return;
-  const perData = {}; gg.forEach(g => perData[g.data] = g);
-  const righe = [['Dipendente', d.nome], ['Reparto', d.reparto || ''], ['Badge', d.badge], ['Anno', anno], [], INTEST_GIORNI];
+  const righe = [];
   for (let m = 1; m <= 12; m++) {
     const mese = `${anno}-${String(m).padStart(2, '0')}`;
-    const tm = totali(gg.filter(g => g.data.startsWith(mese)));
-    righe.push(...righeGiorni(giorniDelMese(mese), perData));
-    righe.push(rigaTotale(`TOTALE ${NOMI_MESI[m - 1].toUpperCase()}`, tm), []);
+    const delMese = gg.filter(g => g.data.startsWith(mese)).sort((a, b) => a.data.localeCompare(b.data));
+    if (!delMese.length) continue;
+    righe.push(...delMese.map(g => rigaGiorno(g.data, g)));
+    righe.push(rigaTotale(`TOTALE ${NOMI_MESI[m - 1].toUpperCase()}`, totali(delMese)));
   }
-  const t = totali(gg);
-  righe.push(rigaTotale('TOTALE ANNO', t));
-  scarica(`ore_${nomeFile(d.nome)}_${anno}.csv`, csv(righe), 'text/csv');
+  esporta({
+    file: `ore_${nomeFile(d.nome)}_${anno}`,
+    titolo: `Riepilogo annuale - ${d.nome}`,
+    info: [['Anno', anno], ['Reparto', d.reparto || '-'], ['Badge', d.badge]],
+    testa: TESTA_GIORNI, righe,
+    totali: [rigaTotale('TOTALE ANNO', totali(gg))],
+    orizzontale: true
+  }, val('fFormato'));
 };
 
-// 3) Totale mese: tabella dipendenti × giorni (ore decimali) + totali
+// 3) Totale mese: dipendenti × giorni (ore decimali) + totali
 document.getElementById('xTotMese').onclick = () => {
   const mese = val('fMese'), giorni = giorniDelMese(mese);
   const gg = calcolaGiornate(db.timbrature, S()).filter(g => g.data.startsWith(mese));
   if (!avvisoAnomalie(gg)) return;
-  const righe = [['Mese', mese], [],
-    ['Dipendente', 'Reparto', ...giorni.map(d => `${giornoSett(d)} ${Number(d.slice(8))}`), 'Totale ore decimali', 'Totale h:mm', 'Ore effettive h:mm', 'Giorni lavorati', 'Pause mancanti', 'Da verificare']];
   const totGiorno = giorni.map(() => 0);
-  for (const d of dipendentiPeriodo(gg)) {
+  const righe = dipendentiPeriodo(gg).map(d => {
     const sue = gg.filter(g => g.dipId === d.id), t = totali(sue);
     const celle = giorni.map((data, i) => {
-      const min = sue.find(g => g.data === data)?.pagatoMin || 0; // ore conteggiate
+      const min = sue.find(g => g.data === data)?.pagatoMin || 0;
       totGiorno[i] += min;
       return min ? oreDecimali(min) : '';
     });
-    righe.push([d.nome, d.reparto || '', ...celle, oreDecimali(t.min), fmtHM(t.min), fmtHM(t.minEff), t.giorni, t.mancanti, t.verificare]);
-  }
+    return [d.nome, d.reparto || '', ...celle, fmtHM(t.min), oreDecimali(t.min), t.giorni, t.mancanti || '', t.verificare || ''];
+  });
   const t = totali(gg);
-  righe.push(['TOTALE', '', ...totGiorno.map(m => m ? oreDecimali(m) : ''), oreDecimali(t.min), fmtHM(t.min), fmtHM(t.minEff), t.giorni, t.mancanti, t.verificare]);
-  scarica(`presenze_totale_${mese}.csv`, csv(righe), 'text/csv');
+  esporta({
+    file: `presenze_totale_${mese}`,
+    titolo: `Presenze del mese - ${nomeMese(mese)}`,
+    info: [['Mese', nomeMese(mese)], ['Ore giornaliere', 'in decimali (7,50 = 7 ore e mezza)']],
+    testa: ['Dipendente', 'Reparto', ...giorni.map(x => `${Number(x.slice(8))}\n${giornoSett(x).slice(0, 2)}`),
+      'Ore', 'Ore\ndec.', 'Giorni', 'Pause\nmanc.', 'Da\nverif.'],
+    righe,
+    totali: [['TOTALE', '', ...totGiorno.map(m => m ? oreDecimali(m) : ''), fmtHM(t.min), oreDecimali(t.min), t.giorni, t.mancanti || '', t.verificare || '']],
+    orizzontale: true, caratteri: 5.5
+  }, val('fFormato'));
 };
 
-// 4) Totale anno: tabella dipendenti × mesi
+// 4) Totale anno: dipendenti × mesi
 document.getElementById('xTotAnno').onclick = () => {
   const anno = val('fMese').slice(0, 4);
   const gg = calcolaGiornate(db.timbrature, S()).filter(g => g.data.startsWith(anno));
   if (!avvisoAnomalie(gg)) return;
-  const righe = [['Anno', anno], [], ['Dipendente', 'Reparto', ...NOMI_MESI, 'Totale ore decimali', 'Totale h:mm', 'Ore effettive h:mm', 'Giorni lavorati']];
   const totMese = Array(12).fill(0);
-  for (const d of dipendentiPeriodo(gg)) {
+  const righe = dipendentiPeriodo(gg).map(d => {
     const sue = gg.filter(g => g.dipId === d.id), t = totali(sue);
     const celle = NOMI_MESI.map((_, i) => {
       const min = totali(sue.filter(g => g.data.slice(5, 7) === String(i + 1).padStart(2, '0'))).min;
       totMese[i] += min;
       return min ? oreDecimali(min) : '';
     });
-    righe.push([d.nome, d.reparto || '', ...celle, oreDecimali(t.min), fmtHM(t.min), fmtHM(t.minEff), t.giorni]);
-  }
+    return [d.nome, d.reparto || '', ...celle, fmtHM(t.min), oreDecimali(t.min), t.giorni];
+  });
   const t = totali(gg);
-  righe.push(['TOTALE', '', ...totMese.map(m => m ? oreDecimali(m) : ''), oreDecimali(t.min), fmtHM(t.min), fmtHM(t.minEff), t.giorni]);
-  scarica(`presenze_totale_${anno}.csv`, csv(righe), 'text/csv');
+  esporta({
+    file: `presenze_totale_${anno}`,
+    titolo: `Presenze dell'anno ${anno}`,
+    info: [['Anno', anno], ['Ore mensili', 'in decimali']],
+    testa: ['Dipendente', 'Reparto', ...NOMI_MESI, 'Ore', 'Ore\ndec.', 'Giorni'],
+    righe,
+    totali: [['TOTALE', '', ...totMese.map(m => m ? oreDecimali(m) : ''), fmtHM(t.min), oreDecimali(t.min), t.giorni]],
+    orizzontale: true, caratteri: 7.5
+  }, val('fFormato'));
 };
 
 /* =====================================================================
