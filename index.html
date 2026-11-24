@@ -271,6 +271,10 @@
         <label>Durata massima di un turno (ore) <input type="number" min="4" id="iTurnoMax"></label>
         <label>Arrotonda a blocchi di (minuti, 0 = no) <input type="number" min="0" id="iPasso"></label>
         <label>Tolleranza arrotondamento (minuti) <input type="number" min="0" id="iTolleranza"></label>
+        <label>Lavoro notturno dalle <input type="time" id="iNotteInizio"></label>
+        <label>Lavoro notturno fino alle <input type="time" id="iNotteFine"></label>
+        <label>Altri festivi ogni anno (gg/mm, separati da virgola) <input id="iFesteExtra" placeholder="es. santo patrono"></label>
+        <label style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="iDomeniche"> Conta le domeniche come festive</label>
         <button id="btnSalvaImpostazioni" class="primario">Salva</button>
       </div>
       <p class="nota-legale">
@@ -280,6 +284,9 @@
         <br>Arrotondamento (solo per le ore conteggiate in busta, le pause si verificano sugli orari reali):
         ENTRATA alla mezz'ora successiva, salvo tolleranza (07:05 &rarr; 07:00, 07:06 &rarr; 07:30, 07:55 &rarr; 08:00);
         USCITA alla mezz'ora precedente, salvo tolleranza (15:55 &rarr; 16:00, 15:54 &rarr; 15:30).
+        <br>Ore notturne e festive: parte delle ore conteggiate che cade nella fascia notturna o in un giorno festivo
+        (festività nazionali, Pasqua e Pasquetta, 4 ottobre dal 2026, più i giorni indicati sopra, es. il santo patrono).
+        <b>Fascia notturna, festivi e maggiorazioni vanno verificati con il consulente del lavoro sul CCNL Turismo applicato.</b>
         <br>"Durata massima di un turno": se un dipendente non timbra l'uscita, dopo queste ore il passaggio
         successivo viene considerato una nuova ENTRATA e la giornata precedente viene segnalata come anomalia.
       </p>
@@ -348,7 +355,11 @@ const PREDEFINITE = {
   antiDoppioSec: 60,     // doppio passaggio ravvicinato = ignorato
   turnoMassimoOre: 16,   // entrata senza uscita oltre questo tempo = anomalia
   arrotondaPassoMin: 30, // ore conteggiate a blocchi di mezz'ora (0 = nessun arrotondamento)
-  arrotondaTolleranzaMin: 5 // minuti di tolleranza sul blocco
+  arrotondaTolleranzaMin: 5, // minuti di tolleranza sul blocco
+  notteInizio: '22:00',   // fascia oraria del lavoro notturno (da verificare sul CCNL)
+  notteFine: '06:00',
+  festeExtra: '',         // altri giorni festivi ogni anno, es. il santo patrono: "24/06"
+  domenicheFestive: false // se true, anche le domeniche contano come festive
 };
 
 const vuoto = () => ({ dipendenti: [], timbrature: [], sconosciuti: [], log: [], impostazioni: { ...PREDEFINITE }, kioskToken: '' });
@@ -503,7 +514,6 @@ function fmtDurata(minuti) {
   const h = Math.floor(minuti / 60), m = minuti % 60;
   return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
 }
-const oreDecimali = minuti => (minuti / 60).toFixed(2).replace('.', ','); // per Excel italiano
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const normalizzaBadge = c => String(c).trim().toUpperCase().replace(/\s+/g, '');
 const dipendente = id => db.dipendenti.find(d => d.id === id);
@@ -554,7 +564,7 @@ function calcolaGiornate(timbrature, s, adesso = Date.now()) {
       const anomalie = [];
       // lavoratoMin = ore EFFETTIVE (orari reali, usate per verificare le pause)
       // pagatoMin    = ore CONTEGGIATE in busta (orari arrotondati a mezz'ora)
-      let lavoratoMin = 0, pagatoMin = 0, inCorso = false;
+      let lavoratoMin = 0, pagatoMin = 0, notteMin = 0, festaMin = 0, inCorso = false;
 
       for (const se of ses) {
         if (se.in && se.out) {
@@ -562,6 +572,8 @@ function calcolaGiornate(timbrature, s, adesso = Date.now()) {
           se.inArr = arrotondaEntrata(se.in.ts, s);
           se.outArr = arrotondaUscita(se.out.ts, s);
           pagatoMin += Math.max(0, se.outArr - se.inArr) / MIN;
+          notteMin += minutiNotturni(se.inArr, se.outArr, s);   // per le maggiorazioni
+          festaMin += minutiFestivi(se.inArr, se.outArr, s);
         }
         else if (se.inCorso) { inCorso = true; lavoratoMin += (adesso - se.in.ts) / MIN; }
         else if (se.in) anomalie.push(`Uscita mancante dopo le ${fmtOra(se.in.ts)}`);
@@ -589,7 +601,7 @@ function calcolaGiornate(timbrature, s, adesso = Date.now()) {
       else if (pause.length)            esito = { cod: 'warn', testo: 'Pausa troppo breve' };
       else                              esito = { cod: 'err',  testo: 'Pausa mancante' };
 
-      giornate.push({ dipId, data, sessioni: ses, lavoratoMin, pagatoMin, pause, esito, anomalie, inCorso });
+      giornate.push({ dipId, data, sessioni: ses, lavoratoMin, pagatoMin, notteMin, festaMin, pause, esito, anomalie, inCorso });
     }
   }
   return giornate.sort((a, b) => b.data.localeCompare(a.data) || nomeDip(a.dipId).localeCompare(nomeDip(b.dipId)));
@@ -618,6 +630,79 @@ function arrotondaUscita(ts, s) {
   const minuto = Math.floor(ts / MIN) * MIN;
   return Math.floor((minuto + s.arrotondaTolleranzaMin * MIN) / passo) * passo;
 }
+/* ---------------------------------------------------------------------
+   ORE NOTTURNE E FESTIVE (per le maggiorazioni in busta)
+   Si calcolano sugli orari CONTEGGIATI (arrotondati), come le ore.
+   - Notturne: la parte del turno che cade nella fascia notturna
+     (Impostazioni, predefinita 22:00–06:00).
+   - Festive: la parte del turno che cade in un giorno festivo
+     (festività nazionali + giorni aggiunti in Impostazioni). Un turno
+     22:00–05:00 del 24/12 ha 2 ore normali e 5 ore festive (25/12).
+   Un'ora notturna in un giorno festivo conta in ENTRAMBE le colonne:
+   la combinazione delle maggiorazioni la decide il consulente.
+   --------------------------------------------------------------------- */
+const sovrapposti = (a1, a2, b1, b2) => Math.max(0, Math.min(a2, b2) - Math.max(a1, b1)) / MIN;
+
+function minutiNotturni(da, a, s) {
+  const [hi, mi] = s.notteInizio.split(':').map(Number), [hf, mf] = s.notteFine.split(':').map(Number);
+  let tot = 0;
+  const g = new Date(da); g.setHours(0, 0, 0, 0); g.setDate(g.getDate() - 1); // parte dal giorno prima
+  for (; g.getTime() < a; g.setDate(g.getDate() + 1)) {
+    const y = g.getFullYear(), m = g.getMonth(), d = g.getDate();
+    const ini = new Date(y, m, d, hi, mi).getTime();
+    let fin = new Date(y, m, d, hf, mf).getTime();
+    if (fin <= ini) fin = new Date(y, m, d + 1, hf, mf).getTime(); // fascia a cavallo della mezzanotte
+    tot += sovrapposti(da, a, ini, fin);
+  }
+  return tot;
+}
+
+function minutiFestivi(da, a, s) {
+  let tot = 0;
+  const g = new Date(da); g.setHours(0, 0, 0, 0);
+  for (; g.getTime() < a; g.setDate(g.getDate() + 1)) {
+    if (!nomeFesta(dataISO(g.getTime()), s)) continue;
+    const fine = new Date(g.getFullYear(), g.getMonth(), g.getDate() + 1).getTime();
+    tot += sovrapposti(da, a, g.getTime(), fine);
+  }
+  return tot;
+}
+
+// Data di Pasqua (algoritmo di Gauss / Meeus)
+function pasqua(anno) {
+  const a = anno % 19, b = Math.floor(anno / 100), c = anno % 100, d = Math.floor(b / 4), e = b % 4;
+  const f = Math.floor((b + 8) / 25), g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const mese = Math.floor((h + l - 7 * m + 114) / 31), giorno = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(anno, mese - 1, giorno, 12);
+}
+// Festività nazionali italiane di un anno: { "2026-12-25": "Natale", ... }
+const cacheFeste = {};
+function festivitaNazionali(anno) {
+  if (cacheFeste[anno]) return cacheFeste[anno];
+  const f = {
+    '01-01': 'Capodanno', '01-06': 'Epifania', '04-25': 'Liberazione', '05-01': 'Festa del lavoro',
+    '06-02': 'Festa della Repubblica', '08-15': 'Ferragosto', '11-01': 'Ognissanti',
+    '12-08': 'Immacolata', '12-25': 'Natale', '12-26': 'Santo Stefano'
+  };
+  if (anno >= 2026) f['10-04'] = 'San Francesco'; // festa nazionale reintrodotta dal 2026
+  const elenco = {};
+  for (const md in f) elenco[`${anno}-${md}`] = f[md];
+  const p = pasqua(anno), lun = new Date(p); lun.setDate(p.getDate() + 1);
+  elenco[dataISO(p.getTime())] = 'Pasqua';
+  elenco[dataISO(lun.getTime())] = 'Lunedì dell\'Angelo';
+  return (cacheFeste[anno] = elenco);
+}
+// Nome della festa per una data, oppure '' se è un giorno normale
+function nomeFesta(iso, s) {
+  const naz = festivitaNazionali(Number(iso.slice(0, 4)))[iso];
+  if (naz) return naz;
+  const ggmm = `${iso.slice(8, 10)}/${iso.slice(5, 7)}`;
+  if ((s.festeExtra || '').split(',').map(x => x.trim()).filter(Boolean).includes(ggmm)) return 'Festività locale';
+  if (s.domenicheFestive && new Date(iso + 'T12:00').getDay() === 0) return 'Domenica';
+  return '';
+}
+
 // "07:30–12:00 · 12:30–16:00" con gli orari arrotondati
 function descriviConteggiati(g) {
   return g.sessioni.filter(se => se.inArr).sort((a, b) => a.inArr - b.inArr)
@@ -921,12 +1006,12 @@ function descriviSessioni(g) {
 
 function renderRiepilogo() {
   const gg = giornateFiltrate();
-  const totMin = gg.reduce((s, g) => s + g.pagatoMin, 0);
+  const tt = totali(gg), totMin = tt.min;
   const mancanti = gg.filter(g => g.esito.testo === 'Pausa mancante' || g.esito.testo === 'Pausa troppo breve').length;
   const anomalie = gg.filter(g => g.anomalie.length).length;
 
   document.getElementById('kpi').innerHTML = `
-    <div><b>${fmtHM(totMin)}</b><span>Ore nel periodo</span></div>
+    <div><b>${fmtHM(totMin)}</b><span>Ore nel periodo · di cui notturne ${fmtHM(tt.notte)} · festive ${fmtHM(tt.festa)}</span></div>
     <div><b>${gg.length}</b><span>Giornate</span></div>
     <div><b style="color:${mancanti ? 'var(--err)' : 'inherit'}">${mancanti}</b><span>Pause mancanti o troppo brevi</span></div>
     <div><b style="color:${anomalie ? 'var(--err)' : 'inherit'}">${anomalie}</b><span>Giornate da verificare</span></div>`;
@@ -949,7 +1034,7 @@ function renderRiepilogo() {
       <td class="num">${fmtData(g.data)}</td>
       <td><a href="#" class="link" title="Apri il foglio ore per correggere" onclick="apriFoglio('${g.dipId}','${g.data.slice(0, 7)}');return false">${esc(nomeDip(g.dipId))}</a><div class="tenue">${esc(dipendente(g.dipId)?.reparto || '')}</div></td>
       <td class="num">${descriviSessioni(g)}${S().arrotondaPassoMin && descriviConteggiati(g) ? `<div class="tenue">conteggiato ${descriviConteggiati(g)}</div>` : ''}</td>
-      <td class="num"><b>${fmtHM(g.pagatoMin)}</b></td>
+      <td class="num"><b>${fmtHM(g.pagatoMin)}</b>${g.notteMin || g.festaMin ? `<div class="tenue">${[g.notteMin ? 'nott. ' + fmtHM(g.notteMin) : '', g.festaMin ? 'fest. ' + fmtHM(g.festaMin) : ''].filter(Boolean).join(' · ')}</div>` : ''}</td>
       <td>${pause}</td>
       <td><span class="etichetta e-${g.esito.cod}">${g.esito.testo}</span></td>
       <td>${g.anomalie.map(esc).join('<br>')}</td></tr>`;
@@ -1136,6 +1221,10 @@ function renderImpostazioni() {
   renderKiosk();
   document.getElementById('iPasso').value = s.arrotondaPassoMin;
   document.getElementById('iTolleranza').value = s.arrotondaTolleranzaMin;
+  document.getElementById('iNotteInizio').value = s.notteInizio;
+  document.getElementById('iNotteFine').value = s.notteFine;
+  document.getElementById('iFesteExtra').value = s.festeExtra;
+  document.getElementById('iDomeniche').checked = !!s.domenicheFestive;
 }
 document.getElementById('btnSalvaImpostazioni').onclick = () => {
   const n = id => Number(document.getElementById(id).value);
@@ -1146,6 +1235,14 @@ document.getElementById('btnSalvaImpostazioni').onclick = () => {
   if (!(passo >= 0) || !(toll >= 0) || (passo && toll >= passo)) return alert('Arrotondamento: la tolleranza deve essere minore del blocco.');
   if (passo && 60 % passo) return alert('Il blocco di arrotondamento deve dividere l\'ora (es. 5, 10, 15, 30, 60).');
   Object.assign(nuove, { arrotondaPassoMin: passo, arrotondaTolleranzaMin: toll });
+  // Fascia notturna e festivi
+  const notteInizio = val('iNotteInizio'), notteFine = val('iNotteFine');
+  if (!/^\d\d:\d\d$/.test(notteInizio) || !/^\d\d:\d\d$/.test(notteFine) || notteInizio === notteFine)
+    return alert('Indica inizio e fine del lavoro notturno (due orari diversi).');
+  const festeExtra = val('iFesteExtra').split(',').map(x => x.trim()).filter(Boolean);
+  const sbagliate = festeExtra.filter(x => !/^(0[1-9]|[12]\d|3[01])\/(0[1-9]|1[0-2])$/.test(x));
+  if (sbagliate.length) return alert('Festivi non validi: ' + sbagliate.join(', ') + '\nUsa il formato gg/mm, es. 24/06');
+  Object.assign(nuove, { notteInizio, notteFine, festeExtra: festeExtra.join(', '), domenicheFestive: document.getElementById('iDomeniche').checked });
   if (nuove.pausaMassimaMin <= nuove.pausaMinimaMin) return alert('La soglia del turno spezzato deve essere maggiore della pausa minima.');
   Object.assign(S(), nuove);
   registraLog('Impostazioni modificate', JSON.stringify(nuove));
@@ -1216,15 +1313,16 @@ function reportPdf(r) {
   // Tabella
   doc.autoTable({
     head: [r.testa], body: r.righe, foot: r.totali.length ? r.totali : undefined, showFoot: 'lastPage',
-    startY: 29, theme: 'grid', margin: { left: 10, right: 10, bottom: 14 },
+    startY: 29, theme: 'grid', margin: { left: 8, right: 8, bottom: 14 }, columnStyles: r.colonne || {},
     styles: { fontSize: r.caratteri || 8, cellPadding: r.spaziatura ?? 1.2, lineColor: [226, 229, 234], lineWidth: 0.1, textColor: [28, 36, 48], valign: 'middle' },
     headStyles: { fillColor: [15, 95, 140], textColor: 255, fontStyle: 'bold', halign: 'center' },
     footStyles: { fillColor: [227, 240, 247], textColor: [15, 95, 140], fontStyle: 'bold' },
     didParseCell: d => {
+      if (d.section === 'head' && r.colonneRosse?.has(d.column.index)) d.cell.styles.fillColor = [180, 35, 24];
       if (d.section !== 'body') return;
       const prima = String(d.row.raw[0] || '');
       if (prima.startsWith('TOTALE')) { d.cell.styles.fontStyle = 'bold'; d.cell.styles.fillColor = [238, 240, 243]; }
-      if (r.domeniche?.has(d.row.index) && d.column.index < 2) d.cell.styles.textColor = [180, 35, 24];
+      if (r.righeRosse?.has(d.row.index) && d.column.index < 2) d.cell.styles.textColor = [180, 35, 24];
     },
     didDrawPage: () => {
       doc.setFontSize(7); doc.setTextColor(150);
@@ -1250,10 +1348,10 @@ document.getElementById('btnCsvRiepilogo').onclick = () => {
     file: `presenze_${val('rDal')}_${val('rAl')}`,
     titolo: 'Riepilogo presenze',
     info: [['Periodo', `${fmtDataBreve(val('rDal'))} - ${fmtDataBreve(val('rAl'))}`], ['Dipendente', val('rDip') ? nomeDip(val('rDip')) : 'Tutti']],
-    testa: ['Data', 'Dipendente', 'Reparto', 'Timbrature', 'Orari conteggiati', 'Ore', 'Ore\ndecimali', 'Pausa\n(min)', 'Spezzato\n(min)', 'Esito pausa', 'Anomalie'],
+    testa: ['Data', 'Dipendente', 'Reparto', 'Timbrature', 'Orari conteggiati', 'Ore', 'Notturne', 'Festive', 'Pausa\n(min)', 'Spezzato\n(min)', 'Esito pausa', 'Anomalie'],
     righe: gg.map(g => [fmtDataBreve(g.data), nomeDip(g.dipId), dipendente(g.dipId)?.reparto || '', descriviSessioni(g), descriviConteggiati(g),
-      fmtHM(g.pagatoMin), oreDecimali(g.pagatoMin), sommaPause(g, 'pausa'), sommaPause(g, 'spezzato'), g.esito.testo, g.anomalie.join(' | ')]),
-    totali: [['TOTALE', `${gg.length} giornate`, '', '', '', fmtHM(tot), oreDecimali(tot), '', '', '', '']],
+      fmtHM(g.pagatoMin), hmVuoto(g.notteMin), hmVuoto(g.festaMin), sommaPause(g, 'pausa'), sommaPause(g, 'spezzato'), g.esito.testo, g.anomalie.join(' | ')]),
+    totali: [['TOTALE', `${gg.length} giornate`, '', '', '', fmtHM(tot), fmtHM(totali(gg).notte), fmtHM(totali(gg).festa), '', '', '', '']],
     orizzontale: true, caratteri: 7.5
   }, val('rFormato'));
 };
@@ -1281,6 +1379,7 @@ document.getElementById('btnCsvTimbrature').onclick = () => {
    ===================================================================== */
 const righeExtra = new Set();   // giorni a cui è stata aggiunta una coppia vuota
 const NOMI_MESI = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu', 'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic'];
+const hmVuoto = min => Math.round(min) ? fmtHM(min) : '';
 const fmtHM = min => { min = Math.round(min); return Math.floor(min / 60) + ':' + String(min % 60).padStart(2, '0'); };
 const giornoSett = iso => new Date(iso + 'T12:00').toLocaleDateString('it-IT', { weekday: 'short' });
 const isDomenica = iso => new Date(iso + 'T12:00').getDay() === 0;
@@ -1296,6 +1395,8 @@ function totali(gg) {
   return {
     giorni: gg.filter(g => g.lavoratoMin > 0).length,
     min: gg.reduce((s, g) => s + g.pagatoMin, 0),       // ore conteggiate (arrotondate a mezz'ora)
+    notte: gg.reduce((s, g) => s + g.notteMin, 0),      // di cui notturne
+    festa: gg.reduce((s, g) => s + g.festaMin, 0),      // di cui festive
     mancanti: gg.filter(g => ['Pausa mancante', 'Pausa troppo breve'].includes(g.esito.testo)).length,
     verificare: gg.filter(g => g.anomalie.length).length
   };
@@ -1332,7 +1433,7 @@ function renderFoglio() {
   document.getElementById('xDipMese').disabled = document.getElementById('xDipAnno').disabled = !dipId;
 
   document.getElementById('fKpi').innerHTML = `
-    <div><b>${fmtHM(t.min)}</b><span>Ore nel mese (${oreDecimali(t.min)} decimali)</span></div>
+    <div><b>${fmtHM(t.min)}</b><span>Ore nel mese · di cui notturne ${fmtHM(t.notte)} · festive ${fmtHM(t.festa)}</span></div>
     <div><b>${t.giorni}</b><span>${dipId ? 'Giorni lavorati' : 'Giornate lavorate (tutti)'}</span></div>
     <div><b style="color:${t.mancanti ? 'var(--err)' : 'inherit'}">${t.mancanti}</b><span>Pause mancanti o brevi</span></div>
     <div><b style="color:${t.verificare ? 'var(--err)' : 'inherit'}">${t.verificare}</b><span>Giornate da verificare</span></div>`;
@@ -1348,15 +1449,16 @@ function renderFoglio() {
         <td>${esc(d.reparto || '')}</td>
         <td class="num">${tt.giorni}</td>
         <td class="num"><b>${fmtHM(tt.min)}</b></td>
-        <td class="num">${oreDecimali(tt.min)}</td>
+        <td class="num">${hmVuoto(tt.notte)}</td>
+        <td class="num">${hmVuoto(tt.festa)}</td>
         <td class="num">${tt.giorni ? fmtHM(tt.min / tt.giorni) : '—'}</td>
         <td class="num">${tt.mancanti || ''}</td>
         <td class="num" style="color:var(--err)">${tt.verificare || ''}</td></tr>`;
     }).join('');
     box.innerHTML = `<table>
-      <thead><tr><th>Dipendente</th><th>Reparto</th><th>Giorni</th><th>Ore</th><th>Ore decimali</th><th>Media/giorno</th><th>Pause mancanti</th><th>Da verificare</th></tr></thead>
+      <thead><tr><th>Dipendente</th><th>Reparto</th><th>Giorni</th><th>Ore</th><th>Notturne</th><th>Festive</th><th>Media/giorno</th><th>Pause mancanti</th><th>Da verificare</th></tr></thead>
       <tbody>${righe || '<tr><td colspan="9" class="vuoto">Nessun dipendente.</td></tr>'}</tbody>
-      <tfoot><tr><td colspan="2">Totale</td><td class="num">${t.giorni}</td><td class="num">${fmtHM(t.min)}</td><td class="num">${oreDecimali(t.min)}</td><td></td><td class="num">${t.mancanti}</td><td class="num">${t.verificare}</td></tr></tfoot>
+      <tfoot><tr><td colspan="2">Totale</td><td class="num">${t.giorni}</td><td class="num">${fmtHM(t.min)}</td><td class="num">${hmVuoto(t.notte)}</td><td class="num">${hmVuoto(t.festa)}</td><td></td><td class="num">${t.mancanti}</td><td class="num">${t.verificare}</td></tr></tfoot>
     </table>`;
     return;
   }
@@ -1368,21 +1470,23 @@ function renderFoglio() {
     const ses = g ? g.sessioni.slice().sort((a, b) => (a.in || a.out).ts - (b.in || b.out).ts) : [];
     let coppie = ses.map((se, i) => coppiaHtml(data, i, se)).join('');
     if (!ses.length || righeExtra.has(data)) coppie += coppiaHtml(data, ses.length, {});
-    return `<tr class="${isDomenica(data) ? 'domenica' : ''}">
-      <td class="num">${giornoSett(data)} ${data.slice(8)}</td>
+    const festa = nomeFesta(data, S());
+    return `<tr class="${isDomenica(data) || festa ? 'domenica' : ''}">
+      <td class="num">${giornoSett(data)} ${data.slice(8)}${festa ? `<div class="tenue">${esc(festa)}</div>` : ''}</td>
       <td><div class="coppie">${coppie}
         ${ses.length ? `<button class="piccolo" title="Aggiungi un'altra entrata/uscita" onclick="aggiungiCoppia('${data}')">+</button>` : ''}</div>
         ${g && S().arrotondaPassoMin && descriviConteggiati(g) ? `<div class="tenue">conteggiato ${descriviConteggiati(g)}</div>` : ''}</td>
-      <td class="num"><b>${g && g.lavoratoMin ? fmtHM(g.pagatoMin) : ''}</b>
-</td>
+      <td class="num"><b>${g && g.lavoratoMin ? fmtHM(g.pagatoMin) : ''}</b></td>
+      <td class="num">${g ? hmVuoto(g.notteMin) : ''}</td>
+      <td class="num">${g ? hmVuoto(g.festaMin) : ''}</td>
       <td class="num">${g && minPausa(g) ? fmtDurata(minPausa(g)) : ''}</td>
       <td>${g ? `<span class="etichetta e-${g.esito.cod}">${g.esito.testo}</span>` : ''}
         ${g && g.anomalie.length ? `<div class="tenue">${g.anomalie.map(esc).join('<br>')}</div>` : ''}</td></tr>`;
   }).join('');
   box.innerHTML = `<table>
-    <thead><tr><th>Giorno</th><th>Entrata – Uscita</th><th>Ore</th><th>Pausa</th><th>Esito pausa</th></tr></thead>
+    <thead><tr><th>Giorno</th><th>Entrata – Uscita</th><th>Ore</th><th>Notturne</th><th>Festive</th><th>Pausa</th><th>Esito pausa</th></tr></thead>
     <tbody>${righe}</tbody>
-    <tfoot><tr><td>Totale</td><td>${t.giorni} giorni lavorati</td><td class="num">${fmtHM(t.min)}</td><td colspan="2">${oreDecimali(t.min)} ore decimali</td></tr></tfoot>
+    <tfoot><tr><td>Totale</td><td>${t.giorni} giorni lavorati</td><td class="num">${fmtHM(t.min)}</td><td class="num">${hmVuoto(t.notte)}</td><td class="num">${hmVuoto(t.festa)}</td><td colspan="2"></td></tr></tfoot>
   </table>`;
 }
 
@@ -1465,14 +1569,18 @@ function avvisoAnomalie(gg) {
   return !n || confirm(`Attenzione: ${n} giornate da verificare (entrata o uscita mancante).\n` +
     `Le ore di quelle timbrature incomplete NON sono conteggiate.\n\nEsportare comunque?`);
 }
-const TESTA_GIORNI = ['Data', 'Giorno', 'Timbrature', 'Orari conteggiati', 'Ore', 'Ore\ndecimali', 'Pausa\n(min)', 'Esito pausa', 'Anomalie'];
+const TESTA_GIORNI = ['Data', 'Giorno', 'Timbrature', 'Orari conteggiati', 'Ore', 'Notturne', 'Festive', 'Pausa\n(min)', 'Esito pausa', 'Anomalie'];
 // Una riga per giorno (anche vuota se non ha lavorato)
 function rigaGiorno(data, g) {
-  if (!g) return [fmtDataBreve(data), giornoSett(data), '', '', '', '', '', '', ''];
-  return [fmtDataBreve(data), giornoSett(data), descriviSessioni(g), descriviConteggiati(g),
-    fmtHM(g.pagatoMin), oreDecimali(g.pagatoMin), Math.round(minPausa(g)) || '', g.esito.testo, g.anomalie.join(' | ')];
+  const festa = nomeFesta(data, S());
+  const giorno = giornoSett(data) + (festa ? ` - ${festa}` : '');
+  if (!g) return [fmtDataBreve(data), giorno, '', '', '', '', '', '', '', ''];
+  return [fmtDataBreve(data), giorno, descriviSessioni(g), descriviConteggiati(g),
+    fmtHM(g.pagatoMin), hmVuoto(g.notteMin), hmVuoto(g.festaMin), Math.round(minPausa(g)) || '', g.esito.testo, g.anomalie.join(' | ')];
 }
-const rigaTotale = (etichetta, t) => [etichetta, `${t.giorni} ${t.giorni === 1 ? 'giorno' : 'giorni'}`, '', '', fmtHM(t.min), oreDecimali(t.min), '', '', ''];
+const rigaTotale = (etichetta, t) => [etichetta, `${t.giorni} ${t.giorni === 1 ? 'giorno' : 'giorni'}`, '', '',
+  fmtHM(t.min), fmtHM(t.notte), fmtHM(t.festa), '', '', ''];
+const giornoRosso = iso => isDomenica(iso) || !!nomeFesta(iso, S());
 const giornateDip = (dipId, prefisso) =>
   calcolaGiornate(db.timbrature.filter(t => t.dipId === dipId), S()).filter(g => g.data.startsWith(prefisso));
 
@@ -1489,7 +1597,7 @@ document.getElementById('xDipMese').onclick = () => {
     info: [['Mese', nomeMese(mese)], ['Reparto', d.reparto || '-'], ['Badge', d.badge]],
     testa: TESTA_GIORNI,
     righe: giorni.map(data => rigaGiorno(data, perData[data])),
-    domeniche: new Set(giorni.map((x, i) => isDomenica(x) ? i : -1).filter(i => i >= 0)),
+    righeRosse: new Set(giorni.map((x, i) => giornoRosso(x) ? i : -1).filter(i => i >= 0)),
     totali: [rigaTotale('TOTALE MESE', totali(gg))],
     orizzontale: true, caratteri: 7.5, spaziatura: 0.85   // tutto il mese su una pagina
   }, val('fFormato'));
@@ -1500,25 +1608,25 @@ document.getElementById('xDipAnno').onclick = () => {
   const anno = val('fMese').slice(0, 4), d = dipendente(val('fDip'));
   const gg = giornateDip(d.id, anno);
   if (!avvisoAnomalie(gg)) return;
-  const righe = [];
+  const righe = [], righeRosse = new Set();
   for (let m = 1; m <= 12; m++) {
     const mese = `${anno}-${String(m).padStart(2, '0')}`;
     const delMese = gg.filter(g => g.data.startsWith(mese)).sort((a, b) => a.data.localeCompare(b.data));
     if (!delMese.length) continue;
-    righe.push(...delMese.map(g => rigaGiorno(g.data, g)));
+    delMese.forEach(g => { if (giornoRosso(g.data)) righeRosse.add(righe.length); righe.push(rigaGiorno(g.data, g)); });
     righe.push(rigaTotale(`TOTALE ${NOMI_MESI[m - 1].toUpperCase()}`, totali(delMese)));
   }
   esporta({
     file: `ore_${nomeFile(d.nome)}_${anno}`,
     titolo: `Riepilogo annuale - ${d.nome}`,
     info: [['Anno', anno], ['Reparto', d.reparto || '-'], ['Badge', d.badge]],
-    testa: TESTA_GIORNI, righe,
+    testa: TESTA_GIORNI, righe, righeRosse,
     totali: [rigaTotale('TOTALE ANNO', totali(gg))],
     orizzontale: true
   }, val('fFormato'));
 };
 
-// 3) Totale mese: dipendenti × giorni (ore decimali) + totali
+// 3) Totale mese: dipendenti × giorni (ore h:mm) + totali con notturne e festive
 document.getElementById('xTotMese').onclick = () => {
   const mese = val('fMese'), giorni = giorniDelMese(mese);
   const gg = calcolaGiornate(db.timbrature, S()).filter(g => g.data.startsWith(mese));
@@ -1529,19 +1637,21 @@ document.getElementById('xTotMese').onclick = () => {
     const celle = giorni.map((data, i) => {
       const min = sue.find(g => g.data === data)?.pagatoMin || 0;
       totGiorno[i] += min;
-      return min ? oreDecimali(min) : '';
+      return hmVuoto(min);
     });
-    return [d.nome, d.reparto || '', ...celle, fmtHM(t.min), oreDecimali(t.min), t.giorni, t.mancanti || '', t.verificare || ''];
+    return [d.nome, ...celle, fmtHM(t.min), hmVuoto(t.notte), hmVuoto(t.festa), t.giorni, t.mancanti || '', t.verificare || ''];
   });
   const t = totali(gg);
   esporta({
     file: `presenze_totale_${mese}`,
     titolo: `Presenze del mese - ${nomeMese(mese)}`,
-    info: [['Mese', nomeMese(mese)], ['Ore giornaliere', 'in decimali (7,50 = 7 ore e mezza)']],
-    testa: ['Dipendente', 'Reparto', ...giorni.map(x => `${Number(x.slice(8))}\n${giornoSett(x).slice(0, 2)}`),
-      'Ore', 'Ore\ndec.', 'Giorni', 'Pause\nmanc.', 'Da\nverif.'],
+    info: [['Mese', nomeMese(mese)], ['In rosso', 'domeniche e festivi']],
+    testa: ['Dipendente', ...giorni.map(x => `${Number(x.slice(8))}\n${giornoSett(x).slice(0, 2)}`),
+      'Ore', 'Nott.', 'Fest.', 'Gg', 'Pausa\nmanc.', 'Da\nverif.'],
+    colonneRosse: new Set(giorni.map((x, i) => giornoRosso(x) ? i + 1 : -1).filter(i => i >= 0)),
+    colonne: { 0: { cellWidth: 26 } }, spaziatura: 0.45,
     righe,
-    totali: [['TOTALE', '', ...totGiorno.map(m => m ? oreDecimali(m) : ''), fmtHM(t.min), oreDecimali(t.min), t.giorni, t.mancanti || '', t.verificare || '']],
+    totali: [['TOTALE', ...totGiorno.map(hmVuoto), fmtHM(t.min), fmtHM(t.notte), fmtHM(t.festa), t.giorni, t.mancanti || '', t.verificare || '']],
     orizzontale: true, caratteri: 5.5
   }, val('fFormato'));
 };
@@ -1557,18 +1667,18 @@ document.getElementById('xTotAnno').onclick = () => {
     const celle = NOMI_MESI.map((_, i) => {
       const min = totali(sue.filter(g => g.data.slice(5, 7) === String(i + 1).padStart(2, '0'))).min;
       totMese[i] += min;
-      return min ? oreDecimali(min) : '';
+      return hmVuoto(min);
     });
-    return [d.nome, d.reparto || '', ...celle, fmtHM(t.min), oreDecimali(t.min), t.giorni];
+    return [d.nome, d.reparto || '', ...celle, fmtHM(t.min), hmVuoto(t.notte), hmVuoto(t.festa), t.giorni];
   });
   const t = totali(gg);
   esporta({
     file: `presenze_totale_${anno}`,
     titolo: `Presenze dell'anno ${anno}`,
-    info: [['Anno', anno], ['Ore mensili', 'in decimali']],
-    testa: ['Dipendente', 'Reparto', ...NOMI_MESI, 'Ore', 'Ore\ndec.', 'Giorni'],
+    info: [['Anno', anno]],
+    testa: ['Dipendente', 'Reparto', ...NOMI_MESI, 'Ore', 'Notturne', 'Festive', 'Giorni'],
     righe,
-    totali: [['TOTALE', '', ...totMese.map(m => m ? oreDecimali(m) : ''), fmtHM(t.min), oreDecimali(t.min), t.giorni]],
+    totali: [['TOTALE', '', ...totMese.map(hmVuoto), fmtHM(t.min), fmtHM(t.notte), fmtHM(t.festa), t.giorni]],
     orizzontale: true, caratteri: 7.5
   }, val('fFormato'));
 };
