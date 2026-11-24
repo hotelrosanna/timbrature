@@ -1,0 +1,1525 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Timbrature – Hotel Rosanna</title>
+<!--
+  ============================================================
+  TIMBRATURE CON BADGE RFID – Hotel Rosanna (prototipo)
+  ------------------------------------------------------------
+  Come funziona:
+  - Il lettore RFID USB si comporta come una TASTIERA: quando passi
+    il badge "scrive" il codice e preme Invio. La pagina lo intercetta.
+  - Primo passaggio = ENTRATA, secondo = USCITA, e così via.
+  - Le pause si ricavano dai "buchi" tra un'uscita e il rientro
+    successivo nella stessa giornata:
+      * buco <= "pausa massima"  -> conta come PAUSA
+      * buco >  "pausa massima"  -> conta come TURNO SPEZZATO
+  - I dati sono salvati nel database Supabase di Hotel Rosanna.
+    Il kiosk non legge i dati: chiama solo la funzione "timbra" con il
+    suo codice segreto. Il pannello richiede login (email + password).
+  - Senza connessione il kiosk mette le timbrature in coda sul tablet
+    e le invia appena torna la rete.
+  - Schema del database e regole di sicurezza: supabase/schema.sql
+  ============================================================
+-->
+<style>
+  :root{
+    --bg:#f4f5f7; --card:#ffffff; --testo:#1c2430; --tenue:#667085; --bordo:#e2e5ea;
+    --primario:#0f5f8c; --primario-chiaro:#e3f0f7;
+    --ok:#127a3f; --ok-bg:#e3f5ea; --warn:#9a5b00; --warn-bg:#fff2d6;
+    --err:#b42318; --err-bg:#fde8e6; --info:#475467; --info-bg:#eef0f3;
+    --kiosk-bg:#0d1b26; --kiosk-testo:#f2f5f8;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--testo)}
+  button{font:inherit;cursor:pointer;border:1px solid var(--bordo);background:var(--card);color:var(--testo);border-radius:8px;padding:8px 14px}
+  button:hover{border-color:var(--primario)}
+  button.primario{background:var(--primario);color:#fff;border-color:var(--primario)}
+  button.piccolo{padding:4px 9px;font-size:13px}
+  button.pericolo{color:var(--err)}
+  input,select{font:inherit;padding:8px 10px;border:1px solid var(--bordo);border-radius:8px;background:#fff;color:var(--testo)}
+  label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--tenue)}
+  svg{width:18px;height:18px;vertical-align:-3px}
+  [hidden]{display:none!important}
+
+  /* ---------- KIOSK (schermata per i dipendenti) ---------- */
+  #kiosk{min-height:100vh;background:var(--kiosk-bg);color:var(--kiosk-testo);display:flex;flex-direction:column;align-items:center;padding:20px 16px;user-select:none}
+  #kiosk header{width:100%;display:flex;justify-content:space-between;align-items:center;opacity:.85}
+  #kiosk header button{background:transparent;color:var(--kiosk-testo);border-color:#2c4150}
+  .orologio{font-size:clamp(64px,16vw,150px);font-weight:200;letter-spacing:2px;margin-top:5vh;font-variant-numeric:tabular-nums}
+  .data-oggi{font-size:20px;opacity:.7;text-transform:capitalize}
+  .esito{margin-top:6vh;width:min(640px,100%);border-radius:20px;padding:30px 24px;text-align:center;background:#16293a;transition:background .2s}
+  .esito .icona svg{width:64px;height:64px}
+  .esito .titolo{font-size:clamp(22px,4vw,34px);font-weight:600;margin-top:10px}
+  .esito .sotto{font-size:18px;opacity:.85;margin-top:6px;min-height:24px}
+  .esito.entrata{background:#11603a}
+  .esito.uscita{background:#0f4f78}
+  .esito.errore{background:#8c1d14}
+  .esito.info{background:#5b4a12}
+  .kiosk-piede{margin-top:auto;opacity:.6;font-size:15px;padding-top:20px}
+
+  /* ---------- PANNELLO AMMINISTRAZIONE ---------- */
+  #admin{max-width:1200px;margin:0 auto;padding:16px}
+  .barra{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between;margin-bottom:14px}
+  .barra h1{font-size:20px;margin:0}
+  .schede{display:flex;gap:6px;flex-wrap:wrap}
+  .schede button.attiva{background:var(--primario);color:#fff;border-color:var(--primario)}
+  .card{background:var(--card);border:1px solid var(--bordo);border-radius:12px;padding:16px;margin-bottom:14px}
+  .card h2{font-size:16px;margin:0 0 12px}
+  .filtri{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+  .kpi{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:14px}
+  .kpi div{background:var(--card);border:1px solid var(--bordo);border-radius:12px;padding:12px 14px}
+  .kpi b{display:block;font-size:24px}
+  .kpi span{font-size:13px;color:var(--tenue)}
+  .tabella{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  th,td{text-align:left;padding:8px;border-bottom:1px solid var(--bordo);vertical-align:top}
+  th{font-size:12px;text-transform:uppercase;color:var(--tenue);font-weight:600;white-space:nowrap}
+  td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+  .etichetta{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600;white-space:nowrap}
+  .e-ok{background:var(--ok-bg);color:var(--ok)}
+  .e-warn{background:var(--warn-bg);color:var(--warn)}
+  .e-err{background:var(--err-bg);color:var(--err)}
+  .e-info{background:var(--info-bg);color:var(--info)}
+  .e-blu{background:var(--primario-chiaro);color:var(--primario)}
+  .tenue{color:var(--tenue);font-size:13px}
+  .griglia-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;align-items:end}
+  .vuoto{color:var(--tenue);padding:16px;text-align:center}
+  .nota-legale{font-size:13px;color:var(--tenue);line-height:1.5}
+
+  /* ---------- FINESTRA MODALE ---------- */
+  .modale{position:fixed;inset:0;background:rgba(10,20,30,.55);display:flex;align-items:center;justify-content:center;padding:16px;z-index:10}
+  .modale .box{background:#fff;color:var(--testo);border-radius:14px;padding:20px;width:min(460px,100%);max-height:90vh;overflow:auto}
+  .modale h3{margin:0 0 14px}
+  .modale .corpo{display:flex;flex-direction:column;gap:10px}
+  .modale .azioni{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+  .modale .errore{color:var(--err);font-size:14px;min-height:18px}
+  /* ---------- FOGLIO ORE (modifica rapida) ---------- */
+  .coppie{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .coppia{display:inline-flex;align-items:center;gap:4px;background:var(--bg);border-radius:8px;padding:3px 5px}
+  input.ora{padding:4px 6px}
+  button.x{padding:2px 8px;color:var(--err)}
+  tr.domenica td{background:#f7f8fa}
+  tr.domenica td:first-child{color:var(--err);font-weight:600}
+  tfoot td{font-weight:700;border-top:2px solid var(--bordo)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  a.link{color:var(--primario);text-decoration:none;font-weight:600}
+  .attesa-badge{padding:14px;border:2px dashed var(--primario);border-radius:10px;text-align:center;color:var(--primario);font-weight:600}
+</style>
+</head>
+<body>
+
+<!-- ======================= KIOSK ======================= -->
+<section id="kiosk">
+  <header>
+    <div><strong>Hotel Rosanna</strong> · Rilevazione presenze</div>
+    <div style="display:flex;gap:8px">
+      <button id="btnSchermoIntero" title="Schermo intero">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>
+      </button>
+      <button id="btnAdmin" title="Amministrazione">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+      </button>
+    </div>
+  </header>
+  <div class="orologio" id="orologio">--:--</div>
+  <div class="data-oggi" id="dataOggi"></div>
+  <div class="esito" id="esito">
+    <div class="icona" id="esitoIcona"></div>
+    <div class="titolo" id="esitoTitolo">Avvicina il badge al lettore</div>
+    <div class="sotto" id="esitoSotto"></div>
+  </div>
+  <div class="kiosk-piede" id="kioskPiede"></div>
+</section>
+
+<!-- ================== PANNELLO AMMINISTRAZIONE ================== -->
+<section id="admin" hidden>
+  <div class="barra">
+    <h1>Presenze personale <span id="statoSalvataggio" style="font-size:13px;font-weight:400"></span>
+      <button id="btnRiprova" class="piccolo" hidden>Riprova</button></h1>
+    <div class="schede" id="schede">
+      <button data-scheda="riepilogo" class="attiva">Riepilogo</button>
+      <button data-scheda="foglio">Foglio ore</button>
+      <button data-scheda="timbrature">Timbrature</button>
+      <button data-scheda="dipendenti">Dipendenti</button>
+      <button data-scheda="impostazioni">Impostazioni</button>
+      <button id="btnKiosk" class="primario">Torna al kiosk</button>
+    </div>
+  </div>
+
+  <!-- RIEPILOGO -->
+  <div id="scheda-riepilogo">
+    <div class="card">
+      <div class="filtri">
+        <label>Dal <input type="date" id="rDal"></label>
+        <label>Al <input type="date" id="rAl"></label>
+        <label>Dipendente <select id="rDip"></select></label>
+        <button data-periodo="oggi">Oggi</button>
+        <button data-periodo="settimana">Questa settimana</button>
+        <button data-periodo="mese">Questo mese</button>
+        <button id="btnCsvRiepilogo">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0-4-4m4 4 4-4M4 21h16"/></svg> Esporta CSV
+        </button>
+      </div>
+    </div>
+    <div class="kpi" id="kpi"></div>
+    <div class="card">
+      <h2>In servizio adesso</h2>
+      <div id="inServizio"></div>
+    </div>
+    <div class="card">
+      <h2>Giornate</h2>
+      <div class="tabella"><table>
+        <thead><tr><th>Data</th><th>Dipendente</th><th>Entrate / uscite</th><th>Ore conteggiate</th><th>Pause</th><th>Esito pausa</th><th>Note</th></tr></thead>
+        <tbody id="tabGiornate"></tbody>
+      </table></div>
+    </div>
+  </div>
+
+  <!-- FOGLIO ORE MENSILE (per buste paga) -->
+  <div id="scheda-foglio" hidden>
+    <div class="card">
+      <div class="filtri">
+        <button id="fPrec" title="Mese precedente">‹</button>
+        <label>Mese <input type="month" id="fMese"></label>
+        <button id="fSucc" title="Mese successivo">›</button>
+        <label>Dipendente <select id="fDip"></select></label>
+      </div>
+      <div class="filtri" style="margin-top:12px">
+        <span class="tenue">Esporta CSV:</span>
+        <button id="xDipMese">Dipendente · mese</button>
+        <button id="xDipAnno">Dipendente · anno</button>
+        <button id="xTotMese">Totale mese (tutti)</button>
+        <button id="xTotAnno">Totale anno (tutti)</button>
+      </div>
+      <p class="tenue" style="margin-bottom:0">Scegli un dipendente per modificare gli orari: scrivi l'ora e premi Invio o Tab.
+        Svuota un orario per cancellarlo. Un'uscita prima dell'entrata viene messa al giorno dopo (turno notturno).
+        Ogni modifica finisce nel registro.</p>
+    </div>
+    <div class="kpi" id="fKpi"></div>
+    <div class="card"><div class="tabella" id="fContenuto"></div></div>
+  </div>
+
+  <!-- TIMBRATURE -->
+  <div id="scheda-timbrature" hidden>
+    <div class="card">
+      <div class="filtri">
+        <label>Dal <input type="date" id="tDal"></label>
+        <label>Al <input type="date" id="tAl"></label>
+        <label>Dipendente <select id="tDip"></select></label>
+        <button id="btnAggiungiTimbratura" class="primario">+ Aggiungi timbratura</button>
+        <button id="btnCsvTimbrature">Esporta CSV</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="tabella"><table>
+        <thead><tr><th>Data</th><th>Ora</th><th>Dipendente</th><th>Tipo</th><th>Origine</th><th>Nota</th><th></th></tr></thead>
+        <tbody id="tabTimbrature"></tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <h2>Prova lettore / simula passaggio badge</h2>
+      <div class="filtri">
+        <label>Codice badge <input id="simCodice" placeholder="es. 0004567890"></label>
+        <button id="btnSimula">Simula passaggio</button>
+      </div>
+      <p class="tenue">Utile per provare senza lettore. La timbratura viene registrata come se fosse passata al kiosk.</p>
+    </div>
+    <div class="card">
+      <h2>Badge non riconosciuti (ultimi 50)</h2>
+      <div id="listaSconosciuti"></div>
+    </div>
+    <div class="card">
+      <h2>Registro modifiche (ultime 100)</h2>
+      <div class="tabella"><table>
+        <thead><tr><th>Quando</th><th>Azione</th><th>Dettaglio</th></tr></thead>
+        <tbody id="tabLog"></tbody>
+      </table></div>
+    </div>
+  </div>
+
+  <!-- DIPENDENTI -->
+  <div id="scheda-dipendenti" hidden>
+    <div class="card">
+      <div class="barra" style="margin:0">
+        <h2 style="margin:0">Dipendenti</h2>
+        <button id="btnNuovoDip" class="primario">+ Nuovo dipendente</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="tabella"><table>
+        <thead><tr><th>Nome</th><th>Reparto</th><th>Badge</th><th>Stato</th><th></th></tr></thead>
+        <tbody id="tabDipendenti"></tbody>
+      </table></div>
+    </div>
+  </div>
+
+  <!-- IMPOSTAZIONI -->
+  <div id="scheda-impostazioni" hidden>
+    <div class="card">
+      <h2>Regole pausa</h2>
+      <div class="griglia-form">
+        <label>Pausa obbligatoria oltre (ore lavorate) <input type="number" step="0.5" min="1" id="iSoglia"></label>
+        <label>Pausa minima (minuti) <input type="number" min="1" id="iPausaMin"></label>
+        <label>Oltre questi minuti è turno spezzato <input type="number" min="10" id="iPausaMax"></label>
+        <label>Ignora doppio passaggio entro (secondi) <input type="number" min="5" id="iAntiDoppio"></label>
+        <label>Durata massima di un turno (ore) <input type="number" min="4" id="iTurnoMax"></label>
+        <label>Arrotonda a blocchi di (minuti, 0 = no) <input type="number" min="0" id="iPasso"></label>
+        <label>Tolleranza arrotondamento (minuti) <input type="number" min="0" id="iTolleranza"></label>
+        <button id="btnSalvaImpostazioni" class="primario">Salva</button>
+      </div>
+      <p class="nota-legale">
+        Riferimento: D.Lgs. 66/2003, art. 8 – se l'orario giornaliero supera le 6 ore spetta una pausa,
+        di durata stabilita dal CCNL; in mancanza almeno 10 minuti. Verifica con il consulente del lavoro
+        la durata prevista dal CCNL Turismo applicato e da eventuali accordi aziendali.
+        <br>Arrotondamento (solo per le ore conteggiate in busta, le pause si verificano sugli orari reali):
+        ENTRATA alla mezz'ora successiva, salvo tolleranza (07:05 &rarr; 07:00, 07:06 &rarr; 07:30, 07:55 &rarr; 08:00);
+        USCITA alla mezz'ora precedente, salvo tolleranza (15:55 &rarr; 16:00, 15:54 &rarr; 15:30).
+        <br>"Durata massima di un turno": se un dipendente non timbra l'uscita, dopo queste ore il passaggio
+        successivo viene considerato una nuova ENTRATA e la giornata precedente viene segnalata come anomalia.
+      </p>
+    </div>
+    <div class="card">
+      <h2>Kiosk</h2>
+      <p id="statoKiosk"></p>
+      <div class="filtri">
+        <button id="btnConfiguraKiosk" class="primario">Usa questo dispositivo come kiosk</button>
+        <button id="btnRimuoviKiosk">Togli questo dispositivo dai kiosk</button>
+        <button id="btnRigeneraToken" class="pericolo">Genera un nuovo codice kiosk</button>
+      </div>
+      <p class="tenue">Il tablet del kiosk timbra usando un codice segreto salvato solo su quel dispositivo:
+        senza il codice nessuno può timbrare da internet. Se il tablet viene perso o rubato, genera un nuovo codice:
+        quello vecchio smette subito di funzionare (poi riconfigura il nuovo tablet).</p>
+    </div>
+    <div class="card">
+      <h2>Copia dei dati</h2>
+      <button id="btnEsportaBackup">Scarica copia dei dati (JSON)</button>
+      <p class="tenue">I dati sono salvati nel database Supabase di Hotel Rosanna. Qui puoi scaricarne una copia
+        (dipendenti e timbrature dal 1° gennaio dell'anno scorso).</p>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= MODALE ======================= -->
+<div class="modale" id="modale" hidden>
+  <div class="box">
+    <h3 id="modTitolo"></h3>
+    <div class="corpo" id="modCorpo"></div>
+    <div class="errore" id="modErrore"></div>
+    <div class="azioni">
+      <button id="modAnnulla">Annulla</button>
+      <button id="modOk" class="primario">Conferma</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js"></script>
+<script>
+/* =====================================================================
+   1. DATI E SALVATAGGIO
+   ===================================================================== */
+/* ---------- CONFIGURAZIONE SUPABASE (progetto Hotel Rosanna) ----------
+   URL e chiave "publishable" sono pubbliche per natura: i dati sono
+   protetti dalle regole RLS del database (vedi supabase/schema.sql). */
+const SUPABASE_URL = 'https://ndqrypwhxckrwiuoqycz.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_wWFQVq1FyLzt8Xla_YZ60w_SEXoB60p';
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Dati salvati solo sul browser di QUESTO dispositivo
+const CHIAVE_TOKEN = 'rosanna_kiosk_token';   // codice segreto del kiosk
+const CHIAVE_CODA  = 'rosanna_kiosk_coda';    // timbrature in attesa di rete
+const leggiLocale = (k, def) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch (e) { return def; } };
+const scriviLocale = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+const tokenKiosk = () => leggiLocale(CHIAVE_TOKEN, '');
+
+// Valori predefiniti delle regole (modificabili da Impostazioni)
+const PREDEFINITE = {
+  sogliaPausaOre: 6,     // oltre 6 ore lavorate la pausa è obbligatoria
+  pausaMinimaMin: 10,    // durata minima perché conti come pausa valida
+  pausaMassimaMin: 120,  // buco più lungo = turno spezzato (non pausa)
+  antiDoppioSec: 60,     // doppio passaggio ravvicinato = ignorato
+  turnoMassimoOre: 16,   // entrata senza uscita oltre questo tempo = anomalia
+  arrotondaPassoMin: 30, // ore conteggiate a blocchi di mezz'ora (0 = nessun arrotondamento)
+  arrotondaTolleranzaMin: 5 // minuti di tolleranza sul blocco
+};
+
+const vuoto = () => ({ dipendenti: [], timbrature: [], sconosciuti: [], log: [], impostazioni: { ...PREDEFINITE }, kioskToken: '' });
+const clona = o => JSON.parse(JSON.stringify(o));
+let db = vuoto();      // dati su cui lavora il pannello
+let copia = vuoto();   // ultima versione uguale al database (serve a capire cosa è cambiato)
+
+function nuovoId() {
+  if (window.crypto?.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16);
+  });
+}
+const S = () => db.impostazioni;
+
+// Registro di ogni modifica manuale (chi ha cambiato cosa e quando)
+function registraLog(azione, dettaglio) {
+  db.log.push({ id: nuovoId(), ts: Date.now(), azione, dettaglio, nuovo: true });
+}
+
+// Conversione righe del database <-> oggetti dell'app
+const daDb = {
+  dip: r => ({ id: r.id, nome: r.nome, reparto: r.reparto || '', badge: r.badge, attivo: r.attivo }),
+  timb: r => ({ id: r.id, dipId: r.dip_id, ts: new Date(r.ts).getTime(), tipo: r.tipo, fonte: r.fonte, nota: r.nota || '' })
+};
+const versoDb = {
+  dip: d => ({ id: d.id, nome: d.nome, reparto: d.reparto || null, badge: d.badge, attivo: d.attivo !== false }),
+  timb: t => ({ id: t.id, dip_id: t.dipId, ts: new Date(t.ts).toISOString(), tipo: t.tipo, fonte: t.fonte, nota: t.nota || null })
+};
+
+// Supabase restituisce al massimo 1000 righe per volta: leggiamo a blocchi
+async function leggiTutto(creaQuery) {
+  const righe = [];
+  for (let da = 0; ; da += 1000) {
+    const { data, error } = await creaQuery().range(da, da + 999);
+    if (error) throw error;
+    righe.push(...data);
+    if (data.length < 1000) return righe;
+  }
+}
+
+// Carica i dati dal database (timbrature dal 1° gennaio dell'anno scorso)
+async function caricaDati() {
+  const inizio = new Date(new Date().getFullYear() - 1, 0, 1).toISOString();
+  const [dip, timb, scon, log, imp] = await Promise.all([
+    leggiTutto(() => sb.from('dipendenti').select('*').order('nome').order('id')),
+    leggiTutto(() => sb.from('timbrature').select('*').gte('ts', inizio).order('ts').order('id')),
+    sb.from('badge_sconosciuti').select('*').order('ts', { ascending: false }).limit(50),
+    sb.from('registro').select('*').order('ts', { ascending: false }).limit(300),
+    sb.from('impostazioni').select('*').eq('id', 1).single()
+  ]);
+  for (const r of [scon, log, imp]) if (r.error) throw r.error;
+  db = {
+    dipendenti: dip.map(daDb.dip),
+    timbrature: timb.map(daDb.timb),
+    sconosciuti: scon.data.map(r => ({ id: r.id, codice: r.codice, ts: new Date(r.ts).getTime() })),
+    log: log.data.reverse().map(r => ({ id: r.id, ts: new Date(r.ts).getTime(), azione: r.azione, dettaglio: r.dettaglio || '' })),
+    impostazioni: { ...PREDEFINITE, ...(imp.data.valori || {}) },
+    kioskToken: imp.data.kiosk_token
+  };
+  copia = clona(db);
+}
+
+/* salva(): invia al database SOLO ciò che è cambiato rispetto a "copia".
+   I salvataggi vengono messi in fila, così non si sovrappongono.
+   Se qualcosa va storto, "copia" non cambia e il prossimo salva()
+   (o il pulsante Riprova) rimanda tutto. */
+let filaSalvataggi = Promise.resolve();
+let erroreSalvataggio = false;
+function salva() { filaSalvataggi = filaSalvataggi.then(sincronizza); return true; }
+
+async function sincronizza() {
+  const ora = clona(db), prima = copia;
+  const mappa = arr => Object.fromEntries(arr.map(x => [x.id, JSON.stringify(x)]));
+  const ok = r => { if (r.error) throw r.error; };
+  try {
+    stato('Salvataggio…');
+    // Dipendenti nuovi o modificati
+    const dPrima = mappa(prima.dipendenti);
+    const dCambiati = ora.dipendenti.filter(d => dPrima[d.id] !== JSON.stringify(d));
+    if (dCambiati.length) ok(await sb.from('dipendenti').upsert(dCambiati.map(versoDb.dip)));
+    // Timbrature nuove, modificate, eliminate
+    const tPrima = mappa(prima.timbrature), tOra = mappa(ora.timbrature);
+    const tCambiate = ora.timbrature.filter(t => tPrima[t.id] !== JSON.stringify(t));
+    const tTolte = prima.timbrature.filter(t => !(t.id in tOra)).map(t => t.id);
+    if (tCambiate.length) ok(await sb.from('timbrature').upsert(tCambiate.map(versoDb.timb)));
+    if (tTolte.length) ok(await sb.from('timbrature').delete().in('id', tTolte));
+    // Badge sconosciuti tolti dall'elenco
+    const sOra = new Set(ora.sconosciuti.map(x => x.id));
+    const sTolti = prima.sconosciuti.filter(x => !sOra.has(x.id)).map(x => x.id);
+    if (sTolti.length) ok(await sb.from('badge_sconosciuti').delete().in('id', sTolti));
+    // Impostazioni e codice kiosk
+    if (JSON.stringify(prima.impostazioni) !== JSON.stringify(ora.impostazioni) || prima.kioskToken !== ora.kioskToken)
+      ok(await sb.from('impostazioni').update({ valori: ora.impostazioni, kiosk_token: ora.kioskToken }).eq('id', 1));
+    // Registro: solo le righe nuove (se già inviate vengono ignorate)
+    const nuovi = ora.log.filter(l => l.nuovo);
+    if (nuovi.length) ok(await sb.from('registro').upsert(
+      nuovi.map(l => ({ id: l.id, ts: new Date(l.ts).toISOString(), azione: l.azione, dettaglio: l.dettaglio })),
+      { ignoreDuplicates: true }));
+    // Tutto salvato
+    const idNuovi = new Set(nuovi.map(l => l.id));
+    db.log.forEach(l => { if (idNuovi.has(l.id)) delete l.nuovo; });
+    ora.log.forEach(l => delete l.nuovo);
+    copia = ora;
+    erroreSalvataggio = false;
+    stato('Salvato ✓', 'ok');
+  } catch (e) {
+    console.error('Salvataggio non riuscito', e);
+    erroreSalvataggio = true;
+    const msg = /badge/.test(e.message || '') ? 'badge già usato da un altro dipendente' : 'controlla la connessione';
+    stato(`⚠ Modifiche NON salvate (${msg})`, 'errore');
+  }
+}
+
+// Messaggio di stato in alto nel pannello
+let timerStato = null;
+function stato(testo, tipo) {
+  const el = document.getElementById('statoSalvataggio');
+  el.textContent = testo;
+  el.style.color = tipo === 'errore' ? 'var(--err)' : tipo === 'ok' ? 'var(--ok)' : 'var(--tenue)';
+  document.getElementById('btnRiprova').hidden = tipo !== 'errore';
+  clearTimeout(timerStato);
+  if (tipo === 'ok') timerStato = setTimeout(() => { el.textContent = ''; }, 3000);
+}
+
+// Ricarica i dati dal database (per vedere le timbrature arrivate dal kiosk)
+async function ricarica(forza) {
+  const tag = document.activeElement?.tagName;
+  const occupato = erroreSalvataggio || !document.getElementById('modale').hidden || ['INPUT', 'SELECT', 'TEXTAREA'].includes(tag);
+  if (vista !== 'admin' || (!forza && occupato)) return;
+  await filaSalvataggi;
+  try { await caricaDati(); aggiornaTutto(); }
+  catch (e) { stato('⚠ Impossibile aggiornare i dati', 'errore'); }
+}
+
+/* =====================================================================
+   2. FUNZIONI DI SUPPORTO (date, formati)
+   ===================================================================== */
+const MIN = 60000, ORA = 3600000;
+
+function dataISO(ts) { // "2026-11-23" in ora locale
+  const d = new Date(ts);
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+const fmtOra = ts => new Date(ts).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+function fmtData(iso) {
+  const d = new Date(iso + 'T12:00');
+  return d.toLocaleDateString('it-IT', { weekday: 'short', day: '2-digit', month: '2-digit', year: 'numeric' });
+}
+function fmtDurata(minuti) {
+  minuti = Math.round(minuti);
+  const h = Math.floor(minuti / 60), m = minuti % 60;
+  return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
+}
+const oreDecimali = minuti => (minuti / 60).toFixed(2).replace('.', ','); // per Excel italiano
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const normalizzaBadge = c => String(c).trim().toUpperCase().replace(/\s+/g, '');
+const dipendente = id => db.dipendenti.find(d => d.id === id);
+const nomeDip = id => dipendente(id)?.nome || '(dipendente eliminato)';
+
+/* =====================================================================
+   3. CALCOLO GIORNATE: ore lavorate, pause, turni spezzati, anomalie
+   ---------------------------------------------------------------------
+   Per ogni dipendente si scorrono le timbrature in ordine di tempo e
+   si formano coppie ENTRATA -> USCITA ("sessioni" di lavoro).
+   La giornata di riferimento è quella dell'ENTRATA (così un turno al
+   bar notturno 22:00 -> 05:00 resta sul giorno in cui è iniziato).
+   ===================================================================== */
+function calcolaGiornate(timbrature, s, adesso = Date.now()) {
+  // Raggruppa le timbrature per dipendente, ordinate per orario
+  const perDip = {};
+  for (const t of timbrature) (perDip[t.dipId] ||= []).push(t);
+
+  const giornate = [];
+  for (const dipId in perDip) {
+    const lista = perDip[dipId].sort((a, b) => a.ts - b.ts);
+    const sessioni = [];
+    let aperta = null;
+
+    for (const t of lista) {
+      if (t.tipo === 'E') {
+        if (aperta) sessioni.push({ in: aperta, out: null }); // entrata senza uscita
+        aperta = t;
+      } else {
+        if (aperta) { sessioni.push({ in: aperta, out: t }); aperta = null; }
+        else sessioni.push({ in: null, out: t });            // uscita senza entrata
+      }
+    }
+    if (aperta) {
+      // Turno ancora aperto: è "in servizio" solo se non troppo vecchio
+      sessioni.push({ in: aperta, out: null, inCorso: adesso - aperta.ts < s.turnoMassimoOre * ORA });
+    }
+
+    // Raggruppa le sessioni per data
+    const perData = {};
+    for (const se of sessioni) {
+      const data = dataISO((se.in || se.out).ts);
+      (perData[data] ||= []).push(se);
+    }
+
+    for (const data in perData) {
+      const ses = perData[data];
+      const anomalie = [];
+      // lavoratoMin = ore EFFETTIVE (orari reali, usate per verificare le pause)
+      // pagatoMin    = ore CONTEGGIATE in busta (orari arrotondati a mezz'ora)
+      let lavoratoMin = 0, pagatoMin = 0, inCorso = false;
+
+      for (const se of ses) {
+        if (se.in && se.out) {
+          lavoratoMin += (se.out.ts - se.in.ts) / MIN;
+          se.inArr = arrotondaEntrata(se.in.ts, s);
+          se.outArr = arrotondaUscita(se.out.ts, s);
+          pagatoMin += Math.max(0, se.outArr - se.inArr) / MIN;
+        }
+        else if (se.inCorso) { inCorso = true; lavoratoMin += (adesso - se.in.ts) / MIN; }
+        else if (se.in) anomalie.push(`Uscita mancante dopo le ${fmtOra(se.in.ts)}`);
+        else anomalie.push(`Entrata mancante prima delle ${fmtOra(se.out.ts)}`);
+      }
+
+      // "Buchi" tra la fine di una sessione e l'inizio della successiva
+      const pause = [];
+      const ordinate = ses.filter(se => se.in).sort((a, b) => a.in.ts - b.in.ts);
+      for (let i = 1; i < ordinate.length; i++) {
+        const prec = ordinate[i - 1];
+        if (!prec.out) continue; // senza uscita non si può misurare il buco
+        const min = (ordinate[i].in.ts - prec.out.ts) / MIN;
+        pause.push({ dalle: prec.out.ts, alle: ordinate[i].in.ts, min, tipo: min <= s.pausaMassimaMin ? 'pausa' : 'spezzato' });
+      }
+
+      // Esito pausa
+      const sogliaMin = s.sogliaPausaOre * 60;
+      const valida = pause.some(p => p.min >= s.pausaMinimaMin); // anche lo spezzato vale come stacco
+      let esito;
+      if (anomalie.length)              esito = { cod: 'err',  testo: 'Da verificare' };
+      else if (inCorso)                 esito = { cod: 'blu',  testo: valida ? 'In servizio · pausa fatta' : 'In servizio' };
+      else if (lavoratoMin <= sogliaMin) esito = { cod: 'info', testo: 'Non obbligatoria' };
+      else if (valida)                  esito = { cod: 'ok',   testo: 'Pausa fatta' };
+      else if (pause.length)            esito = { cod: 'warn', testo: 'Pausa troppo breve' };
+      else                              esito = { cod: 'err',  testo: 'Pausa mancante' };
+
+      giornate.push({ dipId, data, sessioni: ses, lavoratoMin, pagatoMin, pause, esito, anomalie, inCorso });
+    }
+  }
+  return giornate.sort((a, b) => b.data.localeCompare(a.data) || nomeDip(a.dipId).localeCompare(nomeDip(b.dipId)));
+}
+
+/* ---------------------------------------------------------------------
+   ARROTONDAMENTO A MEZZ'ORA con tolleranza (valori da Impostazioni)
+   ENTRATA -> mezz'ora successiva, ma se si timbra entro 5 min dopo
+              una mezz'ora vale quella mezz'ora.
+              07:00-07:05 -> 07:00 · 07:06 -> 07:30 · 07:55 -> 08:00
+   USCITA  -> mezz'ora precedente, ma se si timbra entro 5 min prima
+              di una mezz'ora vale quella mezz'ora.
+              15:55-16:24 -> 16:00 · 15:54 -> 15:30 · 16:25 -> 16:30
+   I secondi vengono ignorati (07:05:40 conta come 07:05).
+   Funziona sull'orario italiano perché il fuso è sempre di ore intere.
+   --------------------------------------------------------------------- */
+function arrotondaEntrata(ts, s) {
+  const passo = s.arrotondaPassoMin * MIN;
+  if (!passo) return ts;
+  const minuto = Math.floor(ts / MIN) * MIN;
+  return Math.ceil((minuto - s.arrotondaTolleranzaMin * MIN) / passo) * passo;
+}
+function arrotondaUscita(ts, s) {
+  const passo = s.arrotondaPassoMin * MIN;
+  if (!passo) return ts;
+  const minuto = Math.floor(ts / MIN) * MIN;
+  return Math.floor((minuto + s.arrotondaTolleranzaMin * MIN) / passo) * passo;
+}
+// "07:30–12:00 · 12:30–16:00" con gli orari arrotondati
+function descriviConteggiati(g) {
+  return g.sessioni.filter(se => se.inArr).sort((a, b) => a.inArr - b.inArr)
+    .map(se => `${fmtOra(se.inArr)}–${fmtOra(se.outArr)}`).join(' · ');
+}
+
+/* =====================================================================
+   4. TIMBRATURA DAL KIOSK
+   ===================================================================== */
+async function timbraBadge(codiceGrezzo) {
+  const codice = normalizzaBadge(codiceGrezzo);
+  if (codice.length < 3) return;
+  if (!tokenKiosk()) {
+    mostraEsito('errore', 'Kiosk non configurato', 'Accedi al pannello → Impostazioni → "Usa questo dispositivo come kiosk"');
+    suono('errore'); return;
+  }
+  // Se ci sono timbrature in coda, vanno inviate prima (l'ordine conta)
+  if (leggiLocale(CHIAVE_CODA, []).length) await inviaCoda();
+  let risposta = null;
+  if (!leggiLocale(CHIAVE_CODA, []).length) {
+    try {
+      const { data, error } = await sb.rpc('timbra', { p_token: tokenKiosk(), p_codice: codice });
+      if (error) throw error;
+      risposta = data;
+    } catch (e) { risposta = null; }
+  }
+  if (!risposta) {
+    // Niente rete: la timbratura resta sul tablet e parte appena possibile
+    const coda = leggiLocale(CHIAVE_CODA, []);
+    coda.push({ codice, ts: Date.now() });
+    scriviLocale(CHIAVE_CODA, coda);
+    mostraEsito('info', 'Timbratura registrata', `Ore ${fmtOra(Date.now())} · senza connessione: verrà inviata appena torna la rete`);
+    suono('ok'); aggiornaPiedeKiosk(); return;
+  }
+  mostraRisposta(risposta);
+}
+
+function mostraRisposta(r) {
+  const nome = (r.nome || '').split(' ')[0];
+  if (r.esito === 'ok' && r.tipo === 'E') {
+    mostraEsito('entrata', `Buon lavoro, ${nome}!`, `ENTRATA alle ${fmtOra(r.ts)}`);
+    suono('ok');
+  } else if (r.esito === 'ok') {
+    const turno = r.entrata ? ` · turno di ${fmtDurata((new Date(r.ts) - new Date(r.entrata)) / MIN)}` : '';
+    mostraEsito('uscita', `Arrivederci, ${nome}!`, `USCITA alle ${fmtOra(r.ts)}${turno}`);
+    suono('ok');
+  } else if (r.esito === 'doppio') {
+    mostraEsito('info', `${r.nome}, hai già timbrato`, `${r.tipo === 'E' ? 'Entrata' : 'Uscita'} registrata alle ${fmtOra(r.ts)}`);
+    suono('info');
+  } else if (r.esito === 'sconosciuto') {
+    mostraEsito('errore', 'Badge non riconosciuto', 'Rivolgiti alla reception');
+    suono('errore');
+  } else if (r.esito === 'non_autorizzato') {
+    mostraEsito('errore', 'Kiosk non autorizzato', 'Il codice del kiosk è cambiato: riconfigura questo dispositivo');
+    suono('errore');
+  } else {
+    mostraEsito('errore', 'Badge non valido', ''); suono('errore');
+  }
+  aggiornaPiedeKiosk();
+}
+
+// Invia le timbrature rimaste in coda, in ordine di orario
+let invioInCorso = false;
+async function inviaCoda() {
+  if (invioInCorso || !tokenKiosk()) return;
+  invioInCorso = true;
+  try {
+    const coda = leggiLocale(CHIAVE_CODA, []);
+    while (coda.length) {
+      const t = coda[0];
+      const { data, error } = await sb.rpc('timbra', { p_token: tokenKiosk(), p_codice: t.codice, p_ts: new Date(t.ts).toISOString() });
+      if (error || !data || data.esito === 'non_autorizzato') break; // riprova più tardi
+      coda.shift();
+      scriviLocale(CHIAVE_CODA, coda);
+    }
+  } catch (e) { /* ancora niente rete */ }
+  finally { invioInCorso = false; }
+}
+
+/* =====================================================================
+   5. LETTORE BADGE (il lettore USB "digita" il codice + Invio)
+   ===================================================================== */
+let buffer = '', timerBuffer = null;
+let attesaBadge = null;       // se impostata, il prossimo badge va a questa funzione (es. associazione)
+let vista = 'kiosk';
+
+document.addEventListener('keydown', e => {
+  const tag = document.activeElement?.tagName;
+  const inCampo = ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag);
+  const modaleAperta = !document.getElementById('modale').hidden;
+  // Al kiosk leggiamo sempre; altrove solo se stiamo aspettando un badge
+  if (!attesaBadge && (vista !== 'kiosk' || inCampo || modaleAperta)) return;
+
+  if (e.key === 'Enter' || e.key === 'Tab') {
+    if (!buffer) return;
+    e.preventDefault();
+    const codice = buffer; buffer = '';
+    if (attesaBadge) { const cb = attesaBadge; attesaBadge = null; cb(normalizzaBadge(codice)); }
+    else timbraBadge(codice);
+    return;
+  }
+  if (e.key.length === 1) {
+    buffer += e.key;
+    clearTimeout(timerBuffer);
+    timerBuffer = setTimeout(() => { buffer = ''; }, 800); // il lettore è velocissimo
+  }
+});
+
+/* =====================================================================
+   6. INTERFACCIA KIOSK
+   ===================================================================== */
+const ICONE = {
+  entrata: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3"/></svg>',
+  uscita:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>',
+  errore:  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M15 9l-6 6M9 9l6 6"/></svg>',
+  info:    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>',
+  badge:   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 15h4M7 11h2M15 9a3 3 0 0 1 0 6M17.5 7a6 6 0 0 1 0 10"/></svg>'
+};
+
+let timerEsito = null;
+function mostraEsito(tipo, titolo, sotto) {
+  const box = document.getElementById('esito');
+  box.className = 'esito ' + tipo;
+  document.getElementById('esitoIcona').innerHTML = ICONE[tipo];
+  document.getElementById('esitoTitolo').textContent = titolo;
+  document.getElementById('esitoSotto').textContent = sotto;
+  clearTimeout(timerEsito);
+  timerEsito = setTimeout(esitoAttesa, 5000); // dopo 5 secondi torna in attesa
+}
+function esitoAttesa() {
+  document.getElementById('esito').className = 'esito';
+  document.getElementById('esitoIcona').innerHTML = ICONE.badge;
+  document.getElementById('esitoTitolo').textContent = 'Avvicina il badge al lettore';
+  document.getElementById('esitoSotto').textContent = '';
+}
+function aggiornaOrologio() {
+  const d = new Date();
+  document.getElementById('orologio').textContent = d.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+  document.getElementById('dataOggi').textContent = d.toLocaleDateString('it-IT', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+}
+async function aggiornaPiedeKiosk() {
+  const piede = document.getElementById('kioskPiede');
+  if (!tokenKiosk()) {
+    piede.textContent = 'Dispositivo non configurato come kiosk: accedi dal lucchetto in alto a destra.';
+    return;
+  }
+  const inCoda = leggiLocale(CHIAVE_CODA, []).length;
+  let n = null;
+  try { const { data, error } = await sb.rpc('in_servizio', { p_token: tokenKiosk() }); if (!error) n = data; } catch (e) {}
+  piede.textContent = (n == null ? 'Connessione assente' : `In servizio ora: ${n}`) +
+    (inCoda ? ` · ${inCoda} timbrature in attesa di invio` : '');
+}
+
+// Suono di conferma (WebAudio, nessun file esterno)
+let audioCtx = null;
+function suono(tipo) {
+  try {
+    audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+    const note = tipo === 'ok' ? [880, 1320] : tipo === 'errore' ? [300, 220] : [600];
+    note.forEach((f, i) => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = f; o.connect(g); g.connect(audioCtx.destination);
+      const t = audioCtx.currentTime + i * 0.15;
+      g.gain.setValueAtTime(0.15, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.14);
+      o.start(t); o.stop(t + 0.15);
+    });
+  } catch (e) { /* audio non disponibile: pazienza */ }
+}
+
+document.getElementById('btnSchermoIntero').onclick = async () => {
+  try {
+    if (!document.fullscreenElement) await document.documentElement.requestFullscreen();
+    else await document.exitFullscreen();
+    if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); // schermo sempre acceso
+  } catch (e) {}
+};
+
+/* =====================================================================
+   7. MODALE GENERICA
+   ===================================================================== */
+let modOnOk = null;
+function apriModale(titolo, html, onOk, testoOk = 'Conferma') {
+  document.getElementById('modTitolo').textContent = titolo;
+  document.getElementById('modCorpo').innerHTML = html;
+  document.getElementById('modErrore').textContent = '';
+  document.getElementById('modOk').textContent = testoOk;
+  document.getElementById('modale').hidden = false;
+  modOnOk = onOk;
+  const primo = document.querySelector('#modCorpo input, #modCorpo select');
+  if (primo) setTimeout(() => primo.focus(), 50);
+}
+function chiudiModale() { document.getElementById('modale').hidden = true; modOnOk = null; attesaBadge = null; }
+function erroreModale(msg) { document.getElementById('modErrore').textContent = msg; }
+document.getElementById('modAnnulla').onclick = chiudiModale;
+document.getElementById('modOk').onclick = () => { if (modOnOk && modOnOk() !== false) chiudiModale(); };
+document.getElementById('modCorpo').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target.tagName === 'INPUT') document.getElementById('modOk').click();
+});
+const val = id => document.getElementById(id).value.trim();
+
+/* =====================================================================
+   8. ACCESSO AL PANNELLO (login con email e password Supabase)
+   ===================================================================== */
+document.getElementById('btnAdmin').onclick = () => {
+  apriModale('Accesso amministrazione',
+    `<label>Email <input type="email" id="mEmail" autocomplete="username"></label>
+     <label>Password <input type="password" id="mPassword" autocomplete="current-password"></label>`,
+    () => { accedi(); return false; }, 'Entra');
+};
+async function accedi() {
+  erroreModale('Accesso in corso…');
+  const { error } = await sb.auth.signInWithPassword({ email: val('mEmail'), password: document.getElementById('mPassword').value });
+  if (error) return erroreModale('Email o password errati');
+  if (!(await eAmministratore())) { await sb.auth.signOut(); return erroreModale('Questo utente non è abilitato al pannello'); }
+  try { await caricaDati(); }
+  catch (e) { return erroreModale('Impossibile leggere i dati: ' + e.message); }
+  chiudiModale();
+  mostraVista('admin');
+}
+async function eAmministratore() {
+  const { data, error } = await sb.from('amministratori').select('user_id').limit(1);
+  return !error && data.length > 0;
+}
+
+function mostraVista(v) {
+  vista = v;
+  document.getElementById('kiosk').hidden = v !== 'kiosk';
+  document.getElementById('admin').hidden = v !== 'admin';
+  if (v === 'admin') { ultimaAttivita = Date.now(); aggiornaTutto(); }
+  else { esci(); esitoAttesa(); aggiornaPiedeKiosk(); }
+}
+// Tornando al kiosk si esce dall'account e si svuotano i dati in memoria
+async function esci() {
+  await filaSalvataggi;
+  await sb.auth.signOut();
+  db = vuoto(); copia = vuoto();
+}
+document.getElementById('btnKiosk').onclick = () => {
+  if (erroreSalvataggio && !confirm('Ci sono modifiche NON salvate che andranno perse. Uscire comunque?')) return;
+  mostraVista('kiosk');
+};
+document.getElementById('btnRiprova').onclick = () => salva();
+window.addEventListener('beforeunload', e => { if (erroreSalvataggio) { e.preventDefault(); e.returnValue = ''; } });
+
+// Sicurezza: il pannello torna al kiosk dopo un po' senza attività
+// (3 minuti sul tablet kiosk, 30 minuti su un PC)
+let ultimaAttivita = Date.now();
+['click', 'keydown', 'mousemove', 'touchstart'].forEach(ev => document.addEventListener(ev, () => ultimaAttivita = Date.now()));
+setInterval(() => {
+  const limite = (tokenKiosk() ? 3 : 30) * 60000;
+  if (vista === 'admin' && document.getElementById('modale').hidden && !erroreSalvataggio && Date.now() - ultimaAttivita > limite) mostraVista('kiosk');
+}, 15000);
+
+// Schede del pannello
+function vaiScheda(nome) {
+  document.querySelectorAll('#schede [data-scheda]').forEach(x => x.classList.toggle('attiva', x.dataset.scheda === nome));
+  ['riepilogo', 'foglio', 'timbrature', 'dipendenti', 'impostazioni'].forEach(n =>
+    document.getElementById('scheda-' + n).hidden = n !== nome);
+  aggiornaTutto();
+}
+document.querySelectorAll('#schede [data-scheda]').forEach(b => b.onclick = () => vaiScheda(b.dataset.scheda));
+
+/* =====================================================================
+   9. SCHEDA RIEPILOGO
+   ===================================================================== */
+function impostaPeriodo(dalId, alId, periodo) {
+  const oggi = new Date();
+  let dal = new Date(oggi);
+  if (periodo === 'settimana') dal.setDate(oggi.getDate() - ((oggi.getDay() + 6) % 7)); // da lunedì
+  if (periodo === 'mese') dal = new Date(oggi.getFullYear(), oggi.getMonth(), 1);
+  document.getElementById(dalId).value = dataISO(dal.getTime());
+  document.getElementById(alId).value = dataISO(oggi.getTime());
+}
+document.querySelectorAll('[data-periodo]').forEach(b => b.onclick = () => {
+  impostaPeriodo('rDal', 'rAl', b.dataset.periodo); renderRiepilogo();
+});
+['rDal', 'rAl', 'rDip'].forEach(id => document.getElementById(id).onchange = renderRiepilogo);
+
+function riempiSelectDip(id) {
+  const sel = document.getElementById(id), prima = sel.value;
+  sel.innerHTML = '<option value="">Tutti</option>' +
+    [...db.dipendenti].sort((a, b) => a.nome.localeCompare(b.nome))
+      .map(d => `<option value="${d.id}">${esc(d.nome)}</option>`).join('');
+  sel.value = prima;
+}
+
+function giornateFiltrate() {
+  const dal = val('rDal'), al = val('rAl'), dip = val('rDip');
+  return calcolaGiornate(db.timbrature, S())
+    .filter(g => (!dal || g.data >= dal) && (!al || g.data <= al) && (!dip || g.dipId === dip));
+}
+
+function descriviSessioni(g) {
+  return g.sessioni.filter(se => se.in || se.out).sort((a, b) => (a.in || a.out).ts - (b.in || b.out).ts)
+    .map(se => {
+      const a = se.in ? fmtOra(se.in.ts) : '??';
+      const b = se.out ? fmtOra(se.out.ts) + (dataISO(se.out.ts) !== g.data ? ' (+1)' : '') : (se.inCorso ? 'in corso' : '??');
+      return `${a}–${b}`;
+    }).join(' · ');
+}
+
+function renderRiepilogo() {
+  const gg = giornateFiltrate();
+  const totMin = gg.reduce((s, g) => s + g.pagatoMin, 0);
+  const totEff = gg.reduce((s, g) => s + g.lavoratoMin, 0);
+  const mancanti = gg.filter(g => g.esito.testo === 'Pausa mancante' || g.esito.testo === 'Pausa troppo breve').length;
+  const anomalie = gg.filter(g => g.anomalie.length).length;
+
+  document.getElementById('kpi').innerHTML = `
+    <div><b>${fmtHM(totMin)}</b><span>Ore conteggiate (effettive ${fmtHM(totEff)})</span></div>
+    <div><b>${gg.length}</b><span>Giornate</span></div>
+    <div><b style="color:${mancanti ? 'var(--err)' : 'inherit'}">${mancanti}</b><span>Pause mancanti o troppo brevi</span></div>
+    <div><b style="color:${anomalie ? 'var(--err)' : 'inherit'}">${anomalie}</b><span>Giornate da verificare</span></div>`;
+
+  const inServ = calcolaGiornate(db.timbrature, S()).filter(g => g.inCorso);
+  document.getElementById('inServizio').innerHTML = inServ.length
+    ? inServ.map(g => {
+        const ent = g.sessioni.find(se => se.inCorso).in.ts;
+        return `<span class="etichetta e-blu" style="margin:0 6px 6px 0">${esc(nomeDip(g.dipId))} · dalle ${fmtOra(ent)}</span>`;
+      }).join('')
+    : '<div class="tenue">Nessuno in servizio.</div>';
+
+  document.getElementById('tabGiornate').innerHTML = gg.length ? gg.map(g => {
+    const pause = g.pause.length
+      ? g.pause.map(p => p.tipo === 'pausa'
+          ? `Pausa ${fmtDurata(p.min)} <span class="tenue">(${fmtOra(p.dalle)}–${fmtOra(p.alle)})</span>`
+          : `Spezzato ${fmtDurata(p.min)} <span class="tenue">(${fmtOra(p.dalle)}–${fmtOra(p.alle)})</span>`).join('<br>')
+      : '<span class="tenue">—</span>';
+    return `<tr>
+      <td class="num">${fmtData(g.data)}</td>
+      <td><a href="#" class="link" title="Apri il foglio ore per correggere" onclick="apriFoglio('${g.dipId}','${g.data.slice(0, 7)}');return false">${esc(nomeDip(g.dipId))}</a><div class="tenue">${esc(dipendente(g.dipId)?.reparto || '')}</div></td>
+      <td class="num">${descriviSessioni(g)}${S().arrotondaPassoMin && descriviConteggiati(g) ? `<div class="tenue">conteggiato ${descriviConteggiati(g)}</div>` : ''}</td>
+      <td class="num"><b>${fmtHM(g.pagatoMin)}</b><div class="tenue">effettive ${fmtHM(g.lavoratoMin)}</div></td>
+      <td>${pause}</td>
+      <td><span class="etichetta e-${g.esito.cod}">${g.esito.testo}</span></td>
+      <td>${g.anomalie.map(esc).join('<br>')}</td></tr>`;
+  }).join('') : '<tr><td colspan="7" class="vuoto">Nessuna giornata nel periodo selezionato.</td></tr>';
+}
+
+/* =====================================================================
+   10. SCHEDA TIMBRATURE (correzioni manuali)
+   ===================================================================== */
+['tDal', 'tAl', 'tDip'].forEach(id => document.getElementById(id).onchange = renderTimbrature);
+
+function timbratureFiltrate() {
+  const dal = val('tDal'), al = val('tAl'), dip = val('tDip');
+  return db.timbrature.filter(t => {
+    const d = dataISO(t.ts);
+    return (!dal || d >= dal) && (!al || d <= al) && (!dip || t.dipId === dip);
+  }).sort((a, b) => b.ts - a.ts);
+}
+
+function renderTimbrature() {
+  const lista = timbratureFiltrate();
+  document.getElementById('tabTimbrature').innerHTML = lista.length ? lista.map(t => `<tr>
+      <td class="num">${fmtData(dataISO(t.ts))}</td>
+      <td class="num">${fmtOra(t.ts)}</td>
+      <td>${esc(nomeDip(t.dipId))}</td>
+      <td><span class="etichetta ${t.tipo === 'E' ? 'e-ok' : 'e-blu'}">${t.tipo === 'E' ? 'Entrata' : 'Uscita'}</span></td>
+      <td>${t.fonte === 'badge' ? 'Badge' : '<span class="etichetta e-warn">Manuale</span>'}</td>
+      <td>${esc(t.nota || '')}</td>
+      <td style="white-space:nowrap">
+        <button class="piccolo" onclick="modificaTimbratura('${t.id}')">Modifica</button>
+        <button class="piccolo pericolo" onclick="eliminaTimbratura('${t.id}')">Elimina</button>
+      </td></tr>`).join('')
+    : '<tr><td colspan="7" class="vuoto">Nessuna timbratura nel periodo.</td></tr>';
+
+  document.getElementById('listaSconosciuti').innerHTML = db.sconosciuti.length
+    ? '<table><tbody>' + db.sconosciuti.map(s => `<tr><td class="num">${fmtData(dataISO(s.ts))} ${fmtOra(s.ts)}</td>
+        <td><code>${esc(s.codice)}</code></td>
+        <td><button class="piccolo" onclick="nuovoDipendente('${esc(s.codice)}')">Crea dipendente con questo badge</button></td></tr>`).join('') + '</tbody></table>'
+    : '<div class="tenue">Nessun badge sconosciuto.</div>';
+
+  document.getElementById('tabLog').innerHTML = db.log.length
+    ? db.log.slice(-100).reverse().map(l => `<tr><td class="num">${fmtData(dataISO(l.ts))} ${fmtOra(l.ts)}</td><td>${esc(l.azione)}</td><td>${esc(l.dettaglio)}</td></tr>`).join('')
+    : '<tr><td colspan="3" class="vuoto">Nessuna modifica registrata.</td></tr>';
+}
+
+function formTimbratura(t) {
+  const opz = db.dipendenti.map(d => `<option value="${d.id}" ${t && t.dipId === d.id ? 'selected' : ''}>${esc(d.nome)}</option>`).join('');
+  const ts = t ? t.ts : Date.now();
+  return `<label>Dipendente <select id="mDip">${opz}</select></label>
+    <label>Data <input type="date" id="mData" value="${dataISO(ts)}"></label>
+    <label>Ora <input type="time" id="mOra" value="${fmtOra(ts)}"></label>
+    <label>Tipo <select id="mTipo">
+      <option value="E" ${t && t.tipo === 'E' ? 'selected' : ''}>Entrata</option>
+      <option value="U" ${t && t.tipo === 'U' ? 'selected' : ''}>Uscita</option></select></label>
+    <label>Motivo della correzione (obbligatorio) <input id="mNota" value="${esc(t?.nota || '')}" placeholder="es. dimenticato il badge"></label>`;
+}
+function leggiFormTimbratura() {
+  if (!val('mDip')) return erroreModale('Seleziona un dipendente'), null;
+  if (!val('mData') || !val('mOra')) return erroreModale('Data e ora obbligatorie'), null;
+  if (!val('mNota')) return erroreModale('Scrivi il motivo della correzione'), null;
+  return { dipId: val('mDip'), ts: new Date(`${val('mData')}T${val('mOra')}`).getTime(), tipo: val('mTipo'), nota: val('mNota') };
+}
+const descriviT = t => `${nomeDip(t.dipId)} · ${t.tipo === 'E' ? 'Entrata' : 'Uscita'} ${fmtData(dataISO(t.ts))} ${fmtOra(t.ts)}`;
+
+document.getElementById('btnAggiungiTimbratura').onclick = () => {
+  if (!db.dipendenti.length) return alert('Prima aggiungi almeno un dipendente.');
+  apriModale('Aggiungi timbratura', formTimbratura(null), () => {
+    const v = leggiFormTimbratura(); if (!v) return false;
+    const t = { id: nuovoId(), ...v, fonte: 'manuale' };
+    db.timbrature.push(t);
+    registraLog('Timbratura aggiunta', `${descriviT(t)} – ${v.nota}`);
+    salva(); aggiornaTutto();
+  });
+};
+window.modificaTimbratura = id => {
+  const t = db.timbrature.find(x => x.id === id);
+  apriModale('Modifica timbratura', formTimbratura(t), () => {
+    const v = leggiFormTimbratura(); if (!v) return false;
+    const prima = descriviT(t);
+    Object.assign(t, v, { fonte: 'manuale' });
+    registraLog('Timbratura modificata', `${prima} → ${descriviT(t)} – ${v.nota}`);
+    salva(); aggiornaTutto();
+  });
+};
+window.eliminaTimbratura = id => {
+  const t = db.timbrature.find(x => x.id === id);
+  apriModale('Elimina timbratura', `<p>${esc(descriviT(t))}</p>
+    <label>Motivo (obbligatorio) <input id="mNota"></label>`, () => {
+    if (!val('mNota')) return erroreModale('Scrivi il motivo'), false;
+    db.timbrature = db.timbrature.filter(x => x.id !== id);
+    registraLog('Timbratura eliminata', `${descriviT(t)} – ${val('mNota')}`);
+    salva(); aggiornaTutto();
+  }, 'Elimina');
+};
+
+document.getElementById('btnSimula').onclick = async () => {
+  const c = val('simCodice'); if (!c) return;
+  await timbraBadge(c);
+  alert(document.getElementById('esitoTitolo').textContent + '\n' + document.getElementById('esitoSotto').textContent);
+  await ricarica(true);
+};
+
+/* =====================================================================
+   11. SCHEDA DIPENDENTI
+   ===================================================================== */
+const REPARTI = ['Reception', 'Sala', 'Cucina', 'Bar', 'Chiosco', 'Piani', 'Lavanderia', 'Manutenzione', 'Altro'];
+
+function formDipendente(d, badgeIniziale) {
+  return `<label>Nome e cognome <input id="mNome" value="${esc(d?.nome || '')}"></label>
+    <label>Reparto <input id="mReparto" list="listaReparti" value="${esc(d?.reparto || '')}">
+      <datalist id="listaReparti">${REPARTI.map(r => `<option value="${r}">`).join('')}</datalist></label>
+    <label>Codice badge <input id="mBadge" value="${esc(d?.badge || badgeIniziale || '')}"></label>
+    <button type="button" id="mLeggiBadge">Leggi badge dal lettore</button>
+    <div id="mAttesa" class="attesa-badge" hidden>Passa ora il badge sul lettore…</div>`;
+}
+function collegaLetturaBadge() {
+  document.getElementById('mLeggiBadge').onclick = () => {
+    document.activeElement.blur();
+    document.getElementById('mAttesa').hidden = false;
+    attesaBadge = codice => {
+      document.getElementById('mBadge').value = codice;
+      document.getElementById('mAttesa').hidden = true;
+      suono('ok');
+    };
+  };
+}
+function salvaDipendente(d) {
+  const nome = val('mNome'), badge = normalizzaBadge(val('mBadge'));
+  if (!nome) return erroreModale('Inserisci il nome'), false;
+  if (!badge) return erroreModale('Associa un badge'), false;
+  const doppione = db.dipendenti.find(x => x.badge === badge && x.id !== d?.id);
+  if (doppione) return erroreModale(`Badge già assegnato a ${doppione.nome}`), false;
+  if (d) {
+    registraLog('Dipendente modificato', `${d.nome} → ${nome}, reparto ${val('mReparto')}, badge ${badge}`);
+    Object.assign(d, { nome, reparto: val('mReparto'), badge });
+  } else {
+    db.dipendenti.push({ id: nuovoId(), nome, reparto: val('mReparto'), badge, attivo: true });
+    registraLog('Dipendente aggiunto', `${nome}, badge ${badge}`);
+  }
+  db.sconosciuti = db.sconosciuti.filter(s => s.codice !== badge);
+  salva(); aggiornaTutto();
+}
+
+window.nuovoDipendente = (badge) => {
+  apriModale('Nuovo dipendente', formDipendente(null, badge), () => salvaDipendente(null), 'Salva');
+  collegaLetturaBadge();
+};
+document.getElementById('btnNuovoDip').onclick = () => nuovoDipendente('');
+
+window.modificaDipendente = id => {
+  const d = dipendente(id);
+  apriModale('Modifica dipendente', formDipendente(d), () => salvaDipendente(d), 'Salva');
+  collegaLetturaBadge();
+};
+window.attivaDipendente = id => {
+  const d = dipendente(id);
+  d.attivo = d.attivo === false;
+  registraLog(d.attivo ? 'Dipendente riattivato' : 'Dipendente disattivato', d.nome);
+  salva(); aggiornaTutto();
+};
+
+function renderDipendenti() {
+  const lista = [...db.dipendenti].sort((a, b) => a.nome.localeCompare(b.nome));
+  document.getElementById('tabDipendenti').innerHTML = lista.length ? lista.map(d => `<tr>
+      <td>${esc(d.nome)}</td><td>${esc(d.reparto || '')}</td><td><code>${esc(d.badge)}</code></td>
+      <td>${d.attivo === false ? '<span class="etichetta e-info">Disattivato</span>' : '<span class="etichetta e-ok">Attivo</span>'}</td>
+      <td style="white-space:nowrap">
+        <button class="piccolo" onclick="modificaDipendente('${d.id}')">Modifica</button>
+        <button class="piccolo" onclick="attivaDipendente('${d.id}')">${d.attivo === false ? 'Riattiva' : 'Disattiva'}</button>
+      </td></tr>`).join('')
+    : '<tr><td colspan="5" class="vuoto">Nessun dipendente. Aggiungi il primo con "+ Nuovo dipendente".</td></tr>';
+}
+
+/* =====================================================================
+   12. SCHEDA IMPOSTAZIONI E BACKUP
+   ===================================================================== */
+function renderImpostazioni() {
+  const s = S();
+  document.getElementById('iSoglia').value = s.sogliaPausaOre;
+  document.getElementById('iPausaMin').value = s.pausaMinimaMin;
+  document.getElementById('iPausaMax').value = s.pausaMassimaMin;
+  document.getElementById('iAntiDoppio').value = s.antiDoppioSec;
+  document.getElementById('iTurnoMax').value = s.turnoMassimoOre;
+  renderKiosk();
+  document.getElementById('iPasso').value = s.arrotondaPassoMin;
+  document.getElementById('iTolleranza').value = s.arrotondaTolleranzaMin;
+}
+document.getElementById('btnSalvaImpostazioni').onclick = () => {
+  const n = id => Number(document.getElementById(id).value);
+  const nuove = { sogliaPausaOre: n('iSoglia'), pausaMinimaMin: n('iPausaMin'), pausaMassimaMin: n('iPausaMax'), antiDoppioSec: n('iAntiDoppio'), turnoMassimoOre: n('iTurnoMax') };
+  if (Object.values(nuove).some(x => !(x > 0))) return alert('Tutti i valori devono essere maggiori di zero.');
+  // Arrotondamento: 0 = disattivato; la tolleranza deve stare dentro il blocco
+  const passo = n('iPasso'), toll = n('iTolleranza');
+  if (!(passo >= 0) || !(toll >= 0) || (passo && toll >= passo)) return alert('Arrotondamento: la tolleranza deve essere minore del blocco.');
+  if (passo && 60 % passo) return alert('Il blocco di arrotondamento deve dividere l\'ora (es. 5, 10, 15, 30, 60).');
+  Object.assign(nuove, { arrotondaPassoMin: passo, arrotondaTolleranzaMin: toll });
+  if (nuove.pausaMassimaMin <= nuove.pausaMinimaMin) return alert('La soglia del turno spezzato deve essere maggiore della pausa minima.');
+  Object.assign(S(), nuove);
+  registraLog('Impostazioni modificate', JSON.stringify(nuove));
+  salva(); alert('Impostazioni salvate.');
+};
+function renderKiosk() {
+  const t = tokenKiosk(), el = document.getElementById('statoKiosk');
+  el.innerHTML = !t ? 'Questo dispositivo <b>non</b> è un kiosk.'
+    : t === db.kioskToken ? '<span class="etichetta e-ok">Questo dispositivo è configurato come kiosk</span>'
+    : '<span class="etichetta e-err">Questo dispositivo ha un codice kiosk vecchio: premi "Usa questo dispositivo come kiosk"</span>';
+}
+document.getElementById('btnConfiguraKiosk').onclick = () => {
+  scriviLocale(CHIAVE_TOKEN, db.kioskToken);
+  registraLog('Kiosk configurato', navigator.userAgent.slice(0, 120));
+  salva(); renderKiosk();
+  alert('Fatto. Tornando al kiosk, questo dispositivo potrà registrare le timbrature.');
+};
+document.getElementById('btnRimuoviKiosk').onclick = () => {
+  try { localStorage.removeItem(CHIAVE_TOKEN); } catch (e) {}
+  renderKiosk();
+};
+document.getElementById('btnRigeneraToken').onclick = () => {
+  if (!confirm('Il codice attuale smetterà di funzionare su TUTTI i kiosk, che andranno riconfigurati. Continuare?')) return;
+  db.kioskToken = (nuovoId() + nuovoId()).replace(/-/g, '');
+  registraLog('Codice kiosk rigenerato', '');
+  salva(); renderKiosk();
+};
+
+function scarica(nomeFile, contenuto, tipo) {
+  const blob = new Blob([contenuto], { type: tipo });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = nomeFile; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+document.getElementById('btnEsportaBackup').onclick = () => {
+  const { kioskToken, ...dati } = db; // il codice del kiosk non va nella copia
+  scarica(`copia_timbrature_${dataISO(Date.now())}.json`, JSON.stringify(dati, null, 2), 'application/json');
+};
+
+/* =====================================================================
+   13. ESPORTAZIONE CSV (separatore ";" per Excel italiano)
+   ===================================================================== */
+const cella = v => `"${String(v ?? '').replace(/"/g, '""')}"`;
+function csv(righe) { return '﻿' + righe.map(r => r.map(cella).join(';')).join('\r\n'); }
+
+document.getElementById('btnCsvRiepilogo').onclick = () => {
+  const righe = [['Data', 'Dipendente', 'Reparto', 'Entrate/Uscite', 'Orari conteggiati', 'Ore conteggiate', 'Ore effettive', 'Minuti pausa', 'Minuti turno spezzato', 'Esito pausa', 'Anomalie']];
+  for (const g of giornateFiltrate().reverse()) {
+    righe.push([g.data, nomeDip(g.dipId), dipendente(g.dipId)?.reparto || '', descriviSessioni(g), descriviConteggiati(g),
+      oreDecimali(g.pagatoMin), oreDecimali(g.lavoratoMin),
+      Math.round(g.pause.filter(p => p.tipo === 'pausa').reduce((s, p) => s + p.min, 0)),
+      Math.round(g.pause.filter(p => p.tipo === 'spezzato').reduce((s, p) => s + p.min, 0)),
+      g.esito.testo, g.anomalie.join(' | ')]);
+  }
+  scarica(`presenze_${val('rDal')}_${val('rAl')}.csv`, csv(righe), 'text/csv');
+};
+document.getElementById('btnCsvTimbrature').onclick = () => {
+  const righe = [['Data', 'Ora', 'Dipendente', 'Reparto', 'Badge', 'Tipo', 'Origine', 'Nota']];
+  for (const t of timbratureFiltrate().reverse()) {
+    const d = dipendente(t.dipId);
+    righe.push([dataISO(t.ts), fmtOra(t.ts), nomeDip(t.dipId), d?.reparto || '', d?.badge || '',
+      t.tipo === 'E' ? 'Entrata' : 'Uscita', t.fonte === 'badge' ? 'Badge' : 'Manuale', t.nota || '']);
+  }
+  scarica(`timbrature_${val('tDal')}_${val('tAl')}.csv`, csv(righe), 'text/csv');
+};
+
+/* =====================================================================
+   14. FOGLIO ORE MENSILE: modifica rapida degli orari + totali
+   ---------------------------------------------------------------------
+   Con "Tutti": tabella delle ore del mese per ogni dipendente.
+   Con un dipendente: una riga per ogni giorno del mese, con gli orari
+   modificabili direttamente (si salva quando esci dal campo / Invio).
+   ===================================================================== */
+const righeExtra = new Set();   // giorni a cui è stata aggiunta una coppia vuota
+const NOMI_MESI = ['Gen', 'Feb', 'Mar', 'Apr', 'Mag', 'Giu', 'Lug', 'Ago', 'Set', 'Ott', 'Nov', 'Dic'];
+const fmtHM = min => { min = Math.round(min); return Math.floor(min / 60) + ':' + String(min % 60).padStart(2, '0'); };
+const giornoSett = iso => new Date(iso + 'T12:00').toLocaleDateString('it-IT', { weekday: 'short' });
+const isDomenica = iso => new Date(iso + 'T12:00').getDay() === 0;
+const minPausa = g => g.pause.filter(p => p.tipo === 'pausa').reduce((s, p) => s + p.min, 0);
+const nomeFile = s => s.replace(/[^\w-]+/g, '_');
+
+function giorniDelMese(mese) { // "2026-11" -> ["2026-11-01", ... "2026-11-30"]
+  const [y, m] = mese.split('-').map(Number);
+  const n = new Date(y, m, 0).getDate();
+  return Array.from({ length: n }, (_, i) => `${mese}-${String(i + 1).padStart(2, '0')}`);
+}
+function totali(gg) {
+  return {
+    giorni: gg.filter(g => g.lavoratoMin > 0).length,
+    min: gg.reduce((s, g) => s + g.pagatoMin, 0),       // ore conteggiate (arrotondate) -> buste paga
+    minEff: gg.reduce((s, g) => s + g.lavoratoMin, 0),  // ore effettive (orari reali)
+    mancanti: gg.filter(g => ['Pausa mancante', 'Pausa troppo breve'].includes(g.esito.testo)).length,
+    verificare: gg.filter(g => g.anomalie.length).length
+  };
+}
+// Dipendenti da mostrare: attivi + disattivati che hanno ore nel periodo
+function dipendentiPeriodo(gg) {
+  return [...db.dipendenti].sort((a, b) => a.nome.localeCompare(b.nome))
+    .filter(d => d.attivo !== false || gg.some(g => g.dipId === d.id));
+}
+
+function cambiaMese(delta) {
+  const [y, m] = val('fMese').split('-').map(Number);
+  document.getElementById('fMese').value = dataISO(new Date(y, m - 1 + delta, 1).getTime()).slice(0, 7);
+  renderFoglio();
+}
+document.getElementById('fPrec').onclick = () => cambiaMese(-1);
+document.getElementById('fSucc').onclick = () => cambiaMese(1);
+document.getElementById('fMese').onchange = renderFoglio;
+document.getElementById('fDip').onchange = renderFoglio;
+
+window.apriFoglio = (dipId, mese) => {
+  vaiScheda('foglio');
+  document.getElementById('fDip').value = dipId;
+  document.getElementById('fMese').value = mese;
+  renderFoglio();
+};
+
+function renderFoglio() {
+  const mese = val('fMese'); if (!mese) return;
+  const dipId = val('fDip');
+  const tutte = calcolaGiornate(db.timbrature, S()).filter(g => g.data.startsWith(mese));
+  const gg = dipId ? tutte.filter(g => g.dipId === dipId) : tutte;
+  const t = totali(gg);
+  document.getElementById('xDipMese').disabled = document.getElementById('xDipAnno').disabled = !dipId;
+
+  document.getElementById('fKpi').innerHTML = `
+    <div><b>${fmtHM(t.min)}</b><span>Ore conteggiate nel mese (${oreDecimali(t.min)} decimali) · effettive ${fmtHM(t.minEff)}</span></div>
+    <div><b>${t.giorni}</b><span>${dipId ? 'Giorni lavorati' : 'Giornate lavorate (tutti)'}</span></div>
+    <div><b style="color:${t.mancanti ? 'var(--err)' : 'inherit'}">${t.mancanti}</b><span>Pause mancanti o brevi</span></div>
+    <div><b style="color:${t.verificare ? 'var(--err)' : 'inherit'}">${t.verificare}</b><span>Giornate da verificare</span></div>`;
+
+  const box = document.getElementById('fContenuto');
+
+  // ---- Vista "Tutti": ore del mese per dipendente ----
+  if (!dipId) {
+    const righe = dipendentiPeriodo(gg).map(d => {
+      const tt = totali(gg.filter(g => g.dipId === d.id));
+      return `<tr>
+        <td><a href="#" class="link" onclick="apriFoglio('${d.id}','${mese}');return false">${esc(d.nome)}</a></td>
+        <td>${esc(d.reparto || '')}</td>
+        <td class="num">${tt.giorni}</td>
+        <td class="num"><b>${fmtHM(tt.min)}</b></td>
+        <td class="num">${oreDecimali(tt.min)}</td>
+        <td class="num">${tt.giorni ? fmtHM(tt.min / tt.giorni) : '—'}</td>
+        <td class="num tenue">${fmtHM(tt.minEff)}</td>
+        <td class="num">${tt.mancanti || ''}</td>
+        <td class="num" style="color:var(--err)">${tt.verificare || ''}</td></tr>`;
+    }).join('');
+    box.innerHTML = `<table>
+      <thead><tr><th>Dipendente</th><th>Reparto</th><th>Giorni</th><th>Ore conteggiate</th><th>Ore decimali</th><th>Media/giorno</th><th>Ore effettive</th><th>Pause mancanti</th><th>Da verificare</th></tr></thead>
+      <tbody>${righe || '<tr><td colspan="9" class="vuoto">Nessun dipendente.</td></tr>'}</tbody>
+      <tfoot><tr><td colspan="2">Totale</td><td class="num">${t.giorni}</td><td class="num">${fmtHM(t.min)}</td><td class="num">${oreDecimali(t.min)}</td><td></td><td class="num">${fmtHM(t.minEff)}</td><td class="num">${t.mancanti}</td><td class="num">${t.verificare}</td></tr></tfoot>
+    </table>`;
+    return;
+  }
+
+  // ---- Vista singolo dipendente: un giorno per riga, orari modificabili ----
+  const perData = {}; gg.forEach(g => perData[g.data] = g);
+  const righe = giorniDelMese(mese).map(data => {
+    const g = perData[data];
+    const ses = g ? g.sessioni.slice().sort((a, b) => (a.in || a.out).ts - (b.in || b.out).ts) : [];
+    let coppie = ses.map((se, i) => coppiaHtml(data, i, se)).join('');
+    if (!ses.length || righeExtra.has(data)) coppie += coppiaHtml(data, ses.length, {});
+    return `<tr class="${isDomenica(data) ? 'domenica' : ''}">
+      <td class="num">${giornoSett(data)} ${data.slice(8)}</td>
+      <td><div class="coppie">${coppie}
+        ${ses.length ? `<button class="piccolo" title="Aggiungi un'altra entrata/uscita" onclick="aggiungiCoppia('${data}')">+</button>` : ''}</div>
+        ${g && S().arrotondaPassoMin && descriviConteggiati(g) ? `<div class="tenue">conteggiato ${descriviConteggiati(g)}</div>` : ''}</td>
+      <td class="num"><b>${g && g.lavoratoMin ? fmtHM(g.pagatoMin) : ''}</b>
+        ${g && g.lavoratoMin ? `<div class="tenue">eff. ${fmtHM(g.lavoratoMin)}</div>` : ''}</td>
+      <td class="num">${g && minPausa(g) ? fmtDurata(minPausa(g)) : ''}</td>
+      <td>${g ? `<span class="etichetta e-${g.esito.cod}">${g.esito.testo}</span>` : ''}
+        ${g && g.anomalie.length ? `<div class="tenue">${g.anomalie.map(esc).join('<br>')}</div>` : ''}</td></tr>`;
+  }).join('');
+  box.innerHTML = `<table>
+    <thead><tr><th>Giorno</th><th>Entrata – Uscita</th><th>Ore</th><th>Pausa</th><th>Esito pausa</th></tr></thead>
+    <tbody>${righe}</tbody>
+    <tfoot><tr><td>Totale</td><td>${t.giorni} giorni lavorati · effettive ${fmtHM(t.minEff)}</td><td class="num">${fmtHM(t.min)}</td><td colspan="2">${oreDecimali(t.min)} ore decimali</td></tr></tfoot>
+  </table>`;
+}
+
+// Una coppia entrata–uscita (campi orario + pulsante elimina)
+function coppiaHtml(data, i, se) {
+  const rif = se.in ? se.in.ts : '';
+  const ids = [se.in?.id, se.out?.id].filter(Boolean).join(',');
+  const giornoDopo = se.in && se.out && dataISO(se.out.ts) !== data;
+  return `<span class="coppia">
+    ${inputOra(se.in, 'E', data, '', `${data}|${i}|E`)}<span>–</span>${inputOra(se.out, 'U', data, rif, `${data}|${i}|U`)}
+    ${giornoDopo ? '<span class="tenue" title="Uscita il giorno dopo">+1</span>' : ''}
+    ${ids ? `<button class="piccolo x" title="Elimina questa entrata/uscita" onclick="eliminaCoppia('${ids}')">×</button>` : ''}
+  </span>`;
+}
+function inputOra(t, tipo, data, rif, chiave) {
+  const v = t ? fmtOra(t.ts) : '';
+  return `<input type="time" class="ora" title="${tipo === 'E' ? 'Entrata' : 'Uscita'}" data-tipo="${tipo}" data-data="${data}"
+    data-rif="${rif}" data-chiave="${chiave}" data-tid="${t ? t.id : ''}" data-orig="${v}" value="${v}">`;
+}
+
+window.aggiungiCoppia = data => {
+  righeExtra.add(data); renderFoglio();
+  document.querySelector(`#fContenuto [data-chiave^="${data}|"][data-tid=""][data-tipo="E"]`)?.focus();
+};
+window.eliminaCoppia = ids => {
+  const lista = ids.split(',').map(id => db.timbrature.find(t => t.id === id)).filter(Boolean);
+  if (!confirm('Eliminare questa entrata/uscita?\n' + lista.map(descriviT).join('\n'))) return;
+  db.timbrature = db.timbrature.filter(t => !ids.split(',').includes(t.id));
+  lista.forEach(t => registraLog('Correzione foglio ore', `Eliminata ${descriviT(t)}`));
+  salva(); renderFoglio();
+};
+
+// Salva l'orario quando si esce dal campo (Invio o Tab). Così mentre
+// scrivi ore e minuti la tabella non si ridisegna sotto le dita.
+const contenitoreFoglio = document.getElementById('fContenuto');
+contenitoreFoglio.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target.classList.contains('ora')) e.target.blur();
+});
+contenitoreFoglio.addEventListener('focusout', e => {
+  const inp = e.target;
+  if (!inp.classList?.contains('ora') || inp.value === inp.dataset.orig) return;
+  salvaOraDaFoglio(inp);
+  const prossima = e.relatedTarget?.dataset?.chiave; // campo su cui si sta spostando il cursore
+  setTimeout(() => {
+    renderFoglio();
+    if (prossima) document.querySelector(`#fContenuto [data-chiave="${prossima}"]`)?.focus();
+  }, 0);
+});
+
+function salvaOraDaFoglio(inp) {
+  const { tipo, data, rif, tid } = inp.dataset;
+  const t = tid ? db.timbrature.find(x => x.id === tid) : null;
+  if (!inp.value) {                       // campo svuotato = cancella la timbratura
+    if (t) {
+      db.timbrature = db.timbrature.filter(x => x.id !== tid);
+      registraLog('Correzione foglio ore', `Eliminata ${descriviT(t)}`);
+    }
+  } else {
+    let ts = new Date(`${data}T${inp.value}`).getTime();
+    if (tipo === 'U' && rif && ts <= Number(rif)) ts += 24 * ORA; // uscita dopo mezzanotte
+    if (t) {
+      const prima = descriviT(t);
+      t.ts = ts; t.fonte = 'manuale'; t.nota ||= 'Corretta da foglio ore';
+      registraLog('Correzione foglio ore', `${prima} → ${fmtOra(ts)}`);
+    } else {
+      const nuova = { id: nuovoId(), dipId: val('fDip'), ts, tipo, fonte: 'manuale', nota: 'Inserita da foglio ore' };
+      db.timbrature.push(nuova);
+      registraLog('Correzione foglio ore', `Aggiunta ${descriviT(nuova)}`);
+      righeExtra.delete(data);
+    }
+  }
+  salva();
+}
+
+/* =====================================================================
+   15. EXPORT PER BUSTE PAGA (CSV ";" apribile con Excel)
+   ===================================================================== */
+function avvisoAnomalie(gg) {
+  const n = gg.filter(g => g.anomalie.length).length;
+  return !n || confirm(`Attenzione: ${n} giornate da verificare (entrata o uscita mancante).\n` +
+    `Le ore di quelle timbrature incomplete NON sono conteggiate.\n\nEsportare comunque?`);
+}
+// Righe giorno per giorno di un dipendente
+function righeGiorni(giorni, perData) {
+  return giorni.map(data => {
+    const g = perData[data];
+    if (!g) return [data, giornoSett(data)];
+    return [data, giornoSett(data), descriviSessioni(g), descriviConteggiati(g),
+      fmtHM(g.pagatoMin), oreDecimali(g.pagatoMin), fmtHM(g.lavoratoMin),
+      Math.round(minPausa(g)), g.esito.testo, g.anomalie.join(' | ')];
+  });
+}
+const INTEST_GIORNI = ['Data', 'Giorno', 'Timbrature reali', 'Orari conteggiati', 'Ore conteggiate (h:mm)', 'Ore conteggiate decimali',
+  'Ore effettive (h:mm)', 'Minuti pausa', 'Esito pausa', 'Anomalie'];
+// Riga di totale allineata alle colonne qui sopra
+const rigaTotale = (etichetta, t) => [etichetta, `${t.giorni} giorni`, '', '', fmtHM(t.min), oreDecimali(t.min), fmtHM(t.minEff)];
+
+// 1) Dipendente · mese: dettaglio giornaliero + totale
+document.getElementById('xDipMese').onclick = () => {
+  const mese = val('fMese'), d = dipendente(val('fDip'));
+  const gg = calcolaGiornate(db.timbrature.filter(t => t.dipId === d.id), S()).filter(g => g.data.startsWith(mese));
+  if (!avvisoAnomalie(gg)) return;
+  const perData = {}; gg.forEach(g => perData[g.data] = g);
+  const t = totali(gg);
+  const righe = [['Dipendente', d.nome], ['Reparto', d.reparto || ''], ['Badge', d.badge], ['Mese', mese], [], INTEST_GIORNI,
+    ...righeGiorni(giorniDelMese(mese), perData), [],
+    rigaTotale('TOTALE MESE', t)];
+  scarica(`ore_${nomeFile(d.nome)}_${mese}.csv`, csv(righe), 'text/csv');
+};
+
+// 2) Dipendente · anno: dettaglio giornaliero con subtotale di ogni mese
+document.getElementById('xDipAnno').onclick = () => {
+  const anno = val('fMese').slice(0, 4), d = dipendente(val('fDip'));
+  const gg = calcolaGiornate(db.timbrature.filter(t => t.dipId === d.id), S()).filter(g => g.data.startsWith(anno));
+  if (!avvisoAnomalie(gg)) return;
+  const perData = {}; gg.forEach(g => perData[g.data] = g);
+  const righe = [['Dipendente', d.nome], ['Reparto', d.reparto || ''], ['Badge', d.badge], ['Anno', anno], [], INTEST_GIORNI];
+  for (let m = 1; m <= 12; m++) {
+    const mese = `${anno}-${String(m).padStart(2, '0')}`;
+    const tm = totali(gg.filter(g => g.data.startsWith(mese)));
+    righe.push(...righeGiorni(giorniDelMese(mese), perData));
+    righe.push(rigaTotale(`TOTALE ${NOMI_MESI[m - 1].toUpperCase()}`, tm), []);
+  }
+  const t = totali(gg);
+  righe.push(rigaTotale('TOTALE ANNO', t));
+  scarica(`ore_${nomeFile(d.nome)}_${anno}.csv`, csv(righe), 'text/csv');
+};
+
+// 3) Totale mese: tabella dipendenti × giorni (ore decimali) + totali
+document.getElementById('xTotMese').onclick = () => {
+  const mese = val('fMese'), giorni = giorniDelMese(mese);
+  const gg = calcolaGiornate(db.timbrature, S()).filter(g => g.data.startsWith(mese));
+  if (!avvisoAnomalie(gg)) return;
+  const righe = [['Mese', mese], [],
+    ['Dipendente', 'Reparto', ...giorni.map(d => `${giornoSett(d)} ${Number(d.slice(8))}`), 'Totale ore decimali', 'Totale h:mm', 'Ore effettive h:mm', 'Giorni lavorati', 'Pause mancanti', 'Da verificare']];
+  const totGiorno = giorni.map(() => 0);
+  for (const d of dipendentiPeriodo(gg)) {
+    const sue = gg.filter(g => g.dipId === d.id), t = totali(sue);
+    const celle = giorni.map((data, i) => {
+      const min = sue.find(g => g.data === data)?.pagatoMin || 0; // ore conteggiate
+      totGiorno[i] += min;
+      return min ? oreDecimali(min) : '';
+    });
+    righe.push([d.nome, d.reparto || '', ...celle, oreDecimali(t.min), fmtHM(t.min), fmtHM(t.minEff), t.giorni, t.mancanti, t.verificare]);
+  }
+  const t = totali(gg);
+  righe.push(['TOTALE', '', ...totGiorno.map(m => m ? oreDecimali(m) : ''), oreDecimali(t.min), fmtHM(t.min), fmtHM(t.minEff), t.giorni, t.mancanti, t.verificare]);
+  scarica(`presenze_totale_${mese}.csv`, csv(righe), 'text/csv');
+};
+
+// 4) Totale anno: tabella dipendenti × mesi
+document.getElementById('xTotAnno').onclick = () => {
+  const anno = val('fMese').slice(0, 4);
+  const gg = calcolaGiornate(db.timbrature, S()).filter(g => g.data.startsWith(anno));
+  if (!avvisoAnomalie(gg)) return;
+  const righe = [['Anno', anno], [], ['Dipendente', 'Reparto', ...NOMI_MESI, 'Totale ore decimali', 'Totale h:mm', 'Ore effettive h:mm', 'Giorni lavorati']];
+  const totMese = Array(12).fill(0);
+  for (const d of dipendentiPeriodo(gg)) {
+    const sue = gg.filter(g => g.dipId === d.id), t = totali(sue);
+    const celle = NOMI_MESI.map((_, i) => {
+      const min = totali(sue.filter(g => g.data.slice(5, 7) === String(i + 1).padStart(2, '0'))).min;
+      totMese[i] += min;
+      return min ? oreDecimali(min) : '';
+    });
+    righe.push([d.nome, d.reparto || '', ...celle, oreDecimali(t.min), fmtHM(t.min), fmtHM(t.minEff), t.giorni]);
+  }
+  const t = totali(gg);
+  righe.push(['TOTALE', '', ...totMese.map(m => m ? oreDecimali(m) : ''), oreDecimali(t.min), fmtHM(t.min), fmtHM(t.minEff), t.giorni]);
+  scarica(`presenze_totale_${anno}.csv`, csv(righe), 'text/csv');
+};
+
+/* =====================================================================
+   16. AVVIO
+   ===================================================================== */
+function aggiornaTutto() {
+  riempiSelectDip('rDip'); riempiSelectDip('tDip'); riempiSelectDip('fDip');
+  renderRiepilogo(); renderFoglio(); renderTimbrature(); renderDipendenti(); renderImpostazioni();
+}
+document.getElementById('fMese').value = dataISO(Date.now()).slice(0, 7);
+impostaPeriodo('rDal', 'rAl', 'settimana');
+impostaPeriodo('tDal', 'tAl', 'settimana');
+aggiornaOrologio(); setInterval(aggiornaOrologio, 1000);
+setInterval(() => { if (vista === 'kiosk') aggiornaPiedeKiosk(); }, 60000);
+setInterval(() => ricarica(false), 60000);           // il pannello si aggiorna ogni minuto
+setInterval(inviaCoda, 30000);                        // riprova a inviare la coda offline
+window.addEventListener('online', () => inviaCoda().then(aggiornaPiedeKiosk));
+esitoAttesa(); aggiornaPiedeKiosk();
+
+// All'apertura: sul tablet kiosk si parte sempre dal kiosk (e si esce
+// dall'account); su un PC già loggato si entra direttamente nel pannello.
+(async () => {
+  try {
+    const { data } = await sb.auth.getSession();
+    if (data.session) {
+      if (tokenKiosk()) await sb.auth.signOut();
+      else if (await eAmministratore()) { await caricaDati(); mostraVista('admin'); }
+    }
+  } catch (e) { console.warn(e); }
+  inviaCoda().then(aggiornaPiedeKiosk);
+})();
+</script>
+</body>
+</html>
