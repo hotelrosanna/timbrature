@@ -356,9 +356,9 @@ const PREDEFINITE = {
   turnoMassimoOre: 16,   // entrata senza uscita oltre questo tempo = anomalia
   arrotondaPassoMin: 30, // ore conteggiate a blocchi di mezz'ora (0 = nessun arrotondamento)
   arrotondaTolleranzaMin: 5, // minuti di tolleranza sul blocco
-  notteInizio: '22:00',   // fascia oraria del lavoro notturno (da verificare sul CCNL)
+  notteInizio: '23:00',   // fascia del lavoro notturno secondo il CCNL applicato: 23:00-06:00
   notteFine: '06:00',
-  festeExtra: '',         // altri giorni festivi ogni anno, es. il santo patrono: "24/06"
+  festeExtra: '24/06',    // altri festivi ogni anno: 24/06 santo patrono di Jesolo
   domenicheFestive: false // se true, anche le domeniche contano come festive
 };
 
@@ -634,7 +634,7 @@ function arrotondaUscita(ts, s) {
    ORE NOTTURNE E FESTIVE (per le maggiorazioni in busta)
    Si calcolano sugli orari CONTEGGIATI (arrotondati), come le ore.
    - Notturne: la parte del turno che cade nella fascia notturna
-     (Impostazioni, predefinita 22:00–06:00).
+     (Impostazioni, predefinita 23:00–06:00 come da CCNL).
    - Festive: la parte del turno che cade in un giorno festivo
      (festività nazionali + giorni aggiunti in Impostazioni). Un turno
      22:00–05:00 del 24/12 ha 2 ore normali e 5 ore festive (25/12).
@@ -698,7 +698,7 @@ function nomeFesta(iso, s) {
   const naz = festivitaNazionali(Number(iso.slice(0, 4)))[iso];
   if (naz) return naz;
   const ggmm = `${iso.slice(8, 10)}/${iso.slice(5, 7)}`;
-  if ((s.festeExtra || '').split(',').map(x => x.trim()).filter(Boolean).includes(ggmm)) return 'Festività locale';
+  if ((s.festeExtra || '').split(',').map(x => x.trim()).filter(Boolean).includes(ggmm)) return ggmm === '24/06' ? 'Santo patrono' : 'Festività locale';
   if (s.domenicheFestive && new Date(iso + 'T12:00').getDay() === 0) return 'Domenica';
   return '';
 }
